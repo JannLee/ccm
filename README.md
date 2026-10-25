@@ -327,3 +327,7 @@ python3 -m unittest tests.test_ccm -v
 ```
 
 The tests use a fake `claude` (`tests/fake_claude.py`) and temporary folders under `_workspace/tmp/`; they never touch your real keychain or `~/.claude`.
+
+## License
+
+[MIT](LICENSE)

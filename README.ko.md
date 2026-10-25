@@ -324,3 +324,7 @@ python3 -m unittest tests.test_ccm -v
 ```
 
 테스트는 가짜 `claude`(`tests/fake_claude.py`)와 `_workspace/tmp/` 아래 임시 폴더만 쓰고, 실제 키체인과 `~/.claude`는 건드리지 않습니다.
+
+## 라이선스
+
+[MIT](LICENSE)

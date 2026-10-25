@@ -4,12 +4,14 @@
 계정마다 CLAUDE_CONFIG_DIR을 따로 두는 Claude Code 공식 다중 계정 방식을 쓴다.
 로그인과 토큰 관리는 Claude Code(`claude auth login`)가 맡고, 이 도구는 토큰을 읽지 않는다.
 사용량은 상태줄 명령이 받는 rate_limits 값을 프로필별로 기록해 보여 준다.
+출력은 한국어와 영어를 지원한다(`tr()`과 `detect_lang()` 참고).
 """
 
 import argparse
 import copy
 import json
 import os
+import plistlib
 import re
 import select
 import shlex
@@ -24,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT = "default"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,23}$")
 
@@ -52,12 +54,12 @@ DEFAULT_PROJECT = {"allowedTools": [], "mcpContextUris": [], "mcpServers": {},
 # Claude Code는 잠금 폴더의 수정 시각을 계속 갱신한다. 이 시간(초)보다 오래 그대로면 남은 잠금으로 본다
 LOCK_STALE = 10
 
-AUTH_LABELS = {
-    "none": "로그인 필요",
-    "api_key": "API 키 사용 중",
-    "api_key_helper": "apiKeyHelper 사용 중",
-    "oauth_token": "토큰 환경변수 사용 중",
-    "third_party": "외부 공급자 사용 중",
+AUTH_LABELS = {   # (한국어, 영어)
+    "none": ("로그인 필요", "login required"),
+    "api_key": ("API 키 사용 중", "using an API key"),
+    "api_key_helper": ("apiKeyHelper 사용 중", "using apiKeyHelper"),
+    "oauth_token": ("토큰 환경변수 사용 중", "using a token variable"),
+    "third_party": ("외부 공급자 사용 중", "using a third-party provider"),
 }
 OVERRIDE_VARS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]
 
@@ -67,6 +69,59 @@ RC_END = "# <<< ccm <<<"
 
 class CcmError(Exception):
     pass
+
+
+# ---------- 출력 언어 ----------
+
+LANGS = ("ko", "en")
+LANG_NAMES = {"ko": "한국어", "en": "English"}
+_LANG = None
+
+
+def mac_languages():
+    """macOS 시스템 언어 목록(선호 순서). macOS가 아니거나 읽지 못하면 빈 목록."""
+    if sys.platform != "darwin":
+        return []
+    try:
+        with open(Path.home() / "Library" / "Preferences" / ".GlobalPreferences.plist", "rb") as f:
+            langs = plistlib.load(f).get("AppleLanguages")
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return []
+    return [str(x) for x in langs] if isinstance(langs, list) else []
+
+
+def detect_lang():
+    """(출력 언어, 근거)를 돌려준다. CCM_LANG → `ccm lang`으로 저장한 값 → 로캘 → macOS 시스템 언어 순서로 본다.
+
+    macOS는 시스템 언어가 한국어여도 터미널의 LANG이 en_US인 경우가 흔하다. 그래서 로캘이 ko가 아니면
+    시스템 언어를 한 번 더 보고, 둘 다 한국어가 아니면 영어로 출력한다.
+    """
+    env = (os.environ.get("CCM_LANG") or "").strip().lower()
+    if env in LANGS:
+        return env, "CCM_LANG"
+    cfg = read_json(ccm_home() / "config.json", {})
+    saved = cfg.get("lang") if isinstance(cfg, dict) else None
+    if saved in LANGS:
+        return saved, "saved"
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        if (os.environ.get(var) or "").lower().startswith("ko"):
+            return "ko", var
+    langs = mac_languages()
+    if langs and langs[0].lower().startswith("ko"):
+        return "ko", "macOS"
+    return "en", "system"
+
+
+def ui_lang():
+    global _LANG
+    if _LANG is None:
+        _LANG = detect_lang()[0]
+    return _LANG
+
+
+def tr(ko, en):
+    """출력 문구를 지금 언어로 고른다. 문구가 쓰이는 자리에 두 언어를 나란히 적는다."""
+    return ko if ui_lang() == "ko" else en
 
 
 # ---------- 경로 ----------
@@ -137,10 +192,14 @@ def override_notice():
         return None
     names = ", ".join(found)
     if os.environ.get("CLAUDECODE"):
-        return (f"{names}: Claude Code 세션 안에서 실행해서 그 세션의 환경변수를 물려받았습니다. "
-                "터미널에서 직접 `ccm`을 실행했을 때 이 안내가 나오지 않으면 문제없습니다.")
-    return (f"{names} 환경변수가 이 셸에 남아 있어, 여기서 실행하는 claude는 로그인 계정 대신 그 값을 씁니다. "
-            f"설정 파일에서 지웠다면 새 터미널을 열거나 `unset {' '.join(found)}`를 실행하세요.")
+        return tr(f"{names}: Claude Code 세션 안에서 실행해서 그 세션의 환경변수를 물려받았습니다. "
+                  "터미널에서 직접 `ccm`을 실행했을 때 이 안내가 나오지 않으면 문제없습니다.",
+                  f"{names}: inherited from the Claude Code session this was run in. "
+                  "If running `ccm` directly in a terminal doesn't show this, there is nothing to fix.")
+    return tr(f"{names} 환경변수가 이 셸에 남아 있어, 여기서 실행하는 claude는 로그인 계정 대신 그 값을 씁니다. "
+              f"설정 파일에서 지웠다면 새 터미널을 열거나 `unset {' '.join(found)}`를 실행하세요.",
+              f"{names} is set in this shell, so claude started here uses it instead of the logged-in account. "
+              f"If you removed it from your shell config, open a new terminal or run `unset {' '.join(found)}`.")
 
 
 def usage_path(name):
@@ -195,7 +254,8 @@ def load_config():
         cfg = {}
     if not isinstance(cfg, dict) or not isinstance(cfg.get("profiles") or {}, dict):
         # 읽지 못한 채로 저장하면 계정 목록이 지워지므로 여기서 멈춘다
-        raise CcmError(f"{path}를 읽지 못했습니다. JSON 문법을 고치거나 파일을 다른 곳으로 옮긴 뒤 다시 실행하세요.")
+        raise CcmError(tr(f"{path}를 읽지 못했습니다. JSON 문법을 고치거나 파일을 다른 곳으로 옮긴 뒤 다시 실행하세요.",
+                          f"Could not read {path}. Fix the JSON or move the file away, then run again."))
     profiles = cfg.get("profiles") or {}
     # default 프로필은 늘 첫 번째에 둔다
     cfg["profiles"] = {DEFAULT: profiles.pop(DEFAULT, {}), **profiles}
@@ -220,7 +280,8 @@ def resolve_name(cfg, query):
         i = int(q)
         if 1 <= i <= len(names):
             return names[i - 1]
-        raise CcmError(f"{i}번 계정이 없습니다. 1~{len(names)} 사이 번호를 입력하세요.")
+        raise CcmError(tr(f"{i}번 계정이 없습니다. 1~{len(names)} 사이 번호를 입력하세요.",
+                          f"There is no account #{i}. Enter a number from 1 to {len(names)}."))
     if q in cfg["profiles"]:
         return q
     ql = q.lower()
@@ -231,8 +292,10 @@ def resolve_name(cfg, query):
     if len(hits) == 1:
         return hits[0]
     if hits:
-        raise CcmError(f"'{query}'에 해당하는 계정이 여러 개입니다: {', '.join(hits)}")
-    raise CcmError(f"'{query}' 계정을 찾지 못했습니다. `ccm ls`로 목록을 확인하세요.")
+        raise CcmError(tr(f"'{query}'에 해당하는 계정이 여러 개입니다: {', '.join(hits)}",
+                          f"'{query}' matches more than one account: {', '.join(hits)}"))
+    raise CcmError(tr(f"'{query}' 계정을 찾지 못했습니다. `ccm ls`로 목록을 확인하세요.",
+                      f"No account matches '{query}'. Run `ccm ls` to see the list."))
 
 
 def detect_profile(cfg, env=None):
@@ -255,7 +318,7 @@ def detect_profile(cfg, env=None):
 def auth_status(name, timeout=30):
     d = profile_dir(name)
     if d is not None and not d.is_dir():
-        return {"error": "프로필 폴더 없음"}
+        return {"error": tr("프로필 폴더 없음", "profile folder missing")}
     try:
         r = subprocess.run([claude_bin(), "auth", "status", "--json"], env=auth_env(name),
                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -290,17 +353,17 @@ def refresh_info(cfg, names=None):
 def account_label(cfg, name):
     d = profile_dir(name)
     if d is not None and not d.is_dir():
-        return "폴더 없음"
+        return tr("폴더 없음", "folder missing")
     info = cfg["profiles"][name].get("info")
     if not info:
-        return "확인 전"
+        return tr("확인 전", "not checked")
     if info.get("error") and not info.get("email"):
-        return "확인 실패"
+        return tr("확인 실패", "check failed")
     method = info.get("authMethod")
     if not info.get("loggedIn"):
-        return "로그인 필요"
+        return tr(*AUTH_LABELS["none"])
     if method and method != "claude.ai":
-        return AUTH_LABELS.get(method, method)
+        return tr(*AUTH_LABELS[method]) if method in AUTH_LABELS else method
     return info.get("email") or "-"
 
 
@@ -377,8 +440,9 @@ def window_pcts(rec, now):
 
 def usage_summary(rec, now):
     five, seven = window_pcts(rec, now)
-    parts = [f"{label} {pct:.0f}%" for label, pct in (("5시간", five), ("주간", seven)) if pct is not None]
-    return " · ".join(parts) or "기록 없음"
+    labels = (tr("5시간", "5h"), tr("주간", "weekly"))
+    parts = [f"{label} {pct:.0f}%" for label, pct in zip(labels, (five, seven)) if pct is not None]
+    return " · ".join(parts) or tr("기록 없음", "no data")
 
 
 def available_at(rec, now):
@@ -488,12 +552,12 @@ def fmt_clock(ts, now):
 def fmt_ago(ts, now):
     sec = max(0, now - ts)
     if sec < 60:
-        return "방금"
+        return tr("방금", "just now")
     if sec < 3600:
-        return f"{int(sec // 60)}분 전"
+        return tr(f"{int(sec // 60)}분 전", f"{int(sec // 60)}m ago")
     if sec < 86400:
-        return f"{int(sec // 3600)}시간 전"
-    return f"{int(sec // 86400)}일 전"
+        return tr(f"{int(sec // 3600)}시간 전", f"{int(sec // 3600)}h ago")
+    return tr(f"{int(sec // 86400)}일 전", f"{int(sec // 86400)}d ago")
 
 
 def bar(pct, width, paint):
@@ -503,13 +567,13 @@ def bar(pct, width, paint):
 
 def window_cell(state, now, paint, bar_width):
     if state is None:
-        return paint("기록 없음", "2")
+        return paint(tr("기록 없음", "no data"), "2")
     pct, reset, passed = state
     text = f"{bar(pct, bar_width, paint)} {paint(f'{pct:3.0f}%', color_for(pct))}"
     if passed:
-        return f"{text} {paint('초기화됨', '32')}"
+        return f"{text} {paint(tr('초기화됨', 'reset'), '32')}"
     if pct >= 100:
-        text += f" {paint('한도', '1;31')}"
+        text += f" {paint(tr('한도', 'LIMIT'), '1;31')}"
     if reset:
         return f"{text} ↻{fmt_clock(reset, now)}"
     return text
@@ -518,7 +582,8 @@ def window_cell(state, now, paint, bar_width):
 def render_table(cfg, now, paint, width, selected=None):
     """표를 줄 목록으로 돌려준다. selected(0부터 센 행 번호)를 주면 그 행에 커서를 표시하고 반전색으로 강조한다."""
     bar_width = 8 if width >= 120 else 5
-    header = ["", "#", "이름", "계정", "요금제", "5시간 사용", "주간 사용", "기록"]
+    header = ["", "#"] + (["이름", "계정", "요금제", "5시간 사용", "주간 사용", "기록"] if ui_lang() == "ko"
+                          else ["name", "account", "plan", "5-hour", "weekly", "updated"])
     rows = []
     for i, name in enumerate(cfg["profiles"], 1):
         info = cfg["profiles"][name].get("info") or {}
@@ -564,16 +629,20 @@ def render_table(cfg, now, paint, width, selected=None):
 
 
 def frame_lines(cfg, now, paint, width, selected=None, interactive=False):
-    title = f"Claude Code 계정 · 현재 {cfg['current']} · {datetime.fromtimestamp(now):%H:%M} 기준"
+    hm = f"{datetime.fromtimestamp(now):%H:%M}"
+    title = tr(f"Claude Code 계정 · 현재 {cfg['current']} · {hm} 기준", f"Claude Code accounts · current: {cfg['current']} · {hm}")
     lines = [paint(title, "1")] + render_table(cfg, now, paint, width, selected)
-    lines.append(paint("사용량은 각 계정으로 Claude Code를 쓸 때 상태줄이 받은 마지막 값이며, "
-                       "초기화 시각이 지난 창은 0%로 표시합니다.", "2"))
+    lines.append(paint(tr("사용량은 각 계정으로 Claude Code를 쓸 때 상태줄이 받은 마지막 값이며, "
+                          "초기화 시각이 지난 창은 0%로 표시합니다.",
+                          "Usage is the last value each account's status line received; "
+                          "windows past their reset time show 0%."), "2"))
     ranked = rank_accounts(cfg, now, exclude=cfg["current"])
     if ranked and not ranked[0][2]:
         name, rec, _ = ranked[0]
         n = list(cfg["profiles"]).index(name) + 1
-        hint = "" if interactive else " · `ccm next`로 전환"
-        lines.append(paint(f"여유가 가장 많은 다른 계정: {n} {name} ({usage_summary(rec, now)}){hint}", "36"))
+        hint = "" if interactive else tr(" · `ccm next`로 전환", " · switch with `ccm next`")
+        lines.append(paint(tr(f"여유가 가장 많은 다른 계정: {n} {name} ({usage_summary(rec, now)}){hint}",
+                              f"Most headroom: {n} {name} ({usage_summary(rec, now)}){hint}"), "36"))
     problem = statusline_problem()
     if problem:
         lines.append(paint(problem[0], "33"))
@@ -620,7 +689,8 @@ def pick_interactive(cfg, no_launch):
     selected = names.index(cfg["current"])
     out, fd = sys.stdout, sys.stdin.fileno()
     paint = Paint(use_color(out))
-    help_line = paint(f"↑↓ 이동 · Enter {'전환' if no_launch else '실행'} · ESC 종료", "2")
+    help_line = paint(tr(f"↑↓ 이동 · Enter {'전환' if no_launch else '실행'} · ESC 종료",
+                         f"↑↓ move · Enter {'switch' if no_launch else 'launch'} · Esc quit"), "2")
     drawn = 0
 
     def draw(status, mark=True):
@@ -647,7 +717,7 @@ def pick_interactive(cfg, no_launch):
                 return None
             if confirming:
                 if key in ("y", "Y", "enter"):
-                    draw(paint("종료했습니다.", "2"), mark=False)
+                    draw(paint(tr("종료했습니다.", "Bye."), "2"), mark=False)
                     return None
                 if key in ("n", "N", "esc"):
                     confirming = False
@@ -662,13 +732,13 @@ def pick_interactive(cfg, no_launch):
             elif key == "enter":
                 name = names[selected]
                 cfg["current"] = name
-                done = (f"현재 계정을 {name}(으)로 바꿨습니다." if no_launch
-                        else f"→ {name} 계정으로 claude를 실행합니다.")
+                done = (tr(f"현재 계정을 {name}(으)로 바꿨습니다.", f"Current account is now {name}.") if no_launch
+                        else tr(f"→ {name} 계정으로 claude를 실행합니다.", f"→ Launching claude as {name}."))
                 draw(paint(done, "36"), mark=False)
                 return name
             elif key in ("esc", "q"):
                 confirming = True
-                draw(paint("ccm을 종료할까요? [Y/n]", "33"))
+                draw(paint(tr("ccm을 종료할까요? [Y/n]", "Quit ccm? [Y/n]"), "33"))
                 continue
             else:
                 continue
@@ -741,9 +811,9 @@ def describe_repairs(done):
     parts = []
     for item, moved, error in done:
         if error:
-            parts.append(f"{item}(실패: {error})")
+            parts.append(tr(f"{item}(실패: {error})", f"{item} (failed: {error})"))
         elif moved:
-            parts.append(f"{item}(따로 있던 {moved}개 옮김)")
+            parts.append(tr(f"{item}(따로 있던 {moved}개 옮김)", f"{item} (moved {moved} separate item{'s' if moved != 1 else ''})"))
         else:
             parts.append(item)
     return ", ".join(parts)
@@ -757,7 +827,8 @@ def ensure_shared(cfg):
             continue
         done = repair_links(d, p.get("share_history", True), name)
         if done:
-            print(f"[{name}] ~/.claude와 공유하도록 연결했습니다: {describe_repairs(done)}", file=sys.stderr)
+            print(tr(f"[{name}] ~/.claude와 공유하도록 연결했습니다: {describe_repairs(done)}",
+                     f"[{name}] linked to share with ~/.claude: {describe_repairs(done)}"), file=sys.stderr)
 
 
 def link_problems(cfg, name):
@@ -768,20 +839,20 @@ def link_problems(cfg, name):
         src, dst = claude_home() / item, d / item
         if dst.is_symlink():
             if dst.resolve() != src.resolve():
-                problems.append((item, "다른 곳을 가리킴", False))
+                problems.append((item, tr("다른 곳을 가리킴", "points elsewhere"), False))
         elif dst.is_dir() and item in STATE_DIRS:
-            problems.append((item, "계정 폴더에 따로 있어 공유되지 않음", True))
+            problems.append((item, tr("계정 폴더에 따로 있어 공유되지 않음", "separate copy in the account folder, not shared"), True))
         elif dst.exists():
-            problems.append((item, "별도 파일로 바뀌어 공유되지 않음", False))
+            problems.append((item, tr("별도 파일로 바뀌어 공유되지 않음", "replaced by a regular file, not shared"), False))
         elif src.exists() or item in STATE_DIRS:
-            problems.append((item, "연결 없음", True))
+            problems.append((item, tr("연결 없음", "not linked"), True))
     return problems
 
 
 def remove_profile_dir(d):
     root = (ccm_home() / "profiles").resolve()
     if d.is_symlink() or d.resolve().parent != root:
-        raise CcmError(f"프로필 폴더 위치가 예상과 다릅니다: {d}")
+        raise CcmError(tr(f"프로필 폴더 위치가 예상과 다릅니다: {d}", f"Unexpected profile folder location: {d}"))
     # 공유 항목은 링크만 지우고 링크가 가리키는 ~/.claude 쪽 원본은 그대로 둔다
     for entry in d.iterdir():
         if entry.is_symlink():
@@ -792,16 +863,16 @@ def remove_profile_dir(d):
 def launch(name, claude_args, announce=True):
     d = profile_dir(name)
     if d is not None and not d.is_dir():
-        raise CcmError(f"{name} 프로필 폴더가 없습니다: {d}")
+        raise CcmError(tr(f"{name} 프로필 폴더가 없습니다: {d}", f"Profile folder for {name} is missing: {d}"))
     exe = claude_bin()
     if announce:
-        print(f"→ {name} 계정으로 claude를 실행합니다.", file=sys.stderr)
+        print(tr(f"→ {name} 계정으로 claude를 실행합니다.", f"→ Launching claude as {name}."), file=sys.stderr)
     sys.stdout.flush()
     sys.stderr.flush()
     try:
         os.execvpe(exe, [exe, *claude_args], profile_env(name))
     except OSError as e:
-        raise CcmError(f"claude를 실행하지 못했습니다: {e}")
+        raise CcmError(tr(f"claude를 실행하지 못했습니다: {e}", f"Could not start claude: {e}"))
 
 
 def login_flow(cfg, name, email=None, sso=False):
@@ -810,28 +881,32 @@ def login_flow(cfg, name, email=None, sso=False):
         cmd += ["--email", email]
     if sso:
         cmd.append("--sso")
-    print("브라우저가 열리면 이 프로필에 쓸 계정으로 로그인하세요.\n"
-          "브라우저에 다른 계정이 로그인되어 있으면 로그아웃하거나, 터미널에 나온 주소를 시크릿 창에서 여세요.")
+    print(tr("브라우저가 열리면 이 프로필에 쓸 계정으로 로그인하세요.\n"
+             "브라우저에 다른 계정이 로그인되어 있으면 로그아웃하거나, 터미널에 나온 주소를 시크릿 창에서 여세요.",
+             "When the browser opens, log in with the account you want for this profile.\n"
+             "If the browser is already logged in to another account, log out or open the URL shown here in a private window."))
     try:
         subprocess.call(cmd, env=profile_env(name))
     except OSError as e:
-        raise CcmError(f"claude를 실행하지 못했습니다: {e}")
+        raise CcmError(tr(f"claude를 실행하지 못했습니다: {e}", f"Could not start claude: {e}"))
     refresh_info(cfg, [name])
     save_config(cfg)
     info = cfg["profiles"][name]["info"]
     if not info.get("loggedIn"):
-        print(f"로그인이 확인되지 않았습니다. `ccm login {name}`으로 다시 시도하세요.")
+        print(tr(f"로그인이 확인되지 않았습니다. `ccm login {name}`으로 다시 시도하세요.",
+                 f"Login was not confirmed. Try again with `ccm login {name}`."))
         return 1
     if info.get("authMethod") not in (None, "claude.ai"):
-        print(f"주의: 이 프로필은 {account_label(cfg, name)}입니다. "
-              f"{', '.join(OVERRIDE_VARS)} 환경변수를 확인하세요.")
+        print(tr(f"주의: 이 프로필은 {account_label(cfg, name)}입니다. {', '.join(OVERRIDE_VARS)} 환경변수를 확인하세요.",
+                 f"Note: this profile is {account_label(cfg, name)}. Check the {', '.join(OVERRIDE_VARS)} variables."))
     plan = info.get("subscriptionType")
-    print(f"로그인 완료: {name} → {info.get('email') or '-'}" + (f" ({plan})" if plan else ""))
+    print(tr("로그인 완료", "Logged in") + f": {name} → {info.get('email') or '-'}" + (f" ({plan})" if plan else ""))
     same = [n for n, p in cfg["profiles"].items() if n != name and info.get("email")
             and (p.get("info") or {}).get("email") == info.get("email")
             and (p.get("info") or {}).get("orgName") == info.get("orgName")]
     if same:
-        print(f"주의: {', '.join(same)} 프로필과 같은 계정입니다.")
+        print(tr(f"주의: {', '.join(same)} 프로필과 같은 계정입니다.",
+                 f"Note: this is the same account as {', '.join(same)}."))
     return 0
 
 
@@ -854,18 +929,22 @@ def statusline_problem():
     """
     sl = (read_json(settings_path(), {}) or {}).get("statusLine")
     if not is_ccm_statusline(sl):
-        return "상태줄이 연결되어 있지 않아 사용량이 기록되지 않습니다. `ccm setup`을 실행하세요.", False
+        return tr("상태줄이 연결되어 있지 않아 사용량이 기록되지 않습니다. `ccm setup`을 실행하세요.",
+                  "The status line isn't connected, so usage isn't recorded. Run `ccm setup`."), False
     try:
         words = shlex.split(sl["command"])
     except ValueError:
         return None
     if len(words) >= 3 and not shutil.which(words[-3]):
-        return (f"상태줄 명령에 적힌 Python({words[-3]})이 없어 사용량이 기록되지 않습니다. "
-                "`ccm doctor --fix`로 고치세요.", True)
+        return tr(f"상태줄 명령에 적힌 Python({words[-3]})이 없어 사용량이 기록되지 않습니다. `ccm doctor --fix`로 고치세요.",
+                  f"The Python in the status line command ({words[-3]}) is missing, so usage isn't recorded. "
+                  "Fix it with `ccm doctor --fix`."), True
     script = words[-2] if len(words) >= 2 else ""
     if "/" in script and not Path(script).expanduser().exists() or "/" not in script and not shutil.which(script):
-        return (f"상태줄 명령에 적힌 {script} 파일이 없어 사용량이 기록되지 않습니다. "
-                "ccm 폴더를 옮겼다면 새 위치에서 `./ccm doctor --fix`를 실행하세요.", True)
+        return tr(f"상태줄 명령에 적힌 {script} 파일이 없어 사용량이 기록되지 않습니다. "
+                  "ccm 폴더를 옮겼다면 새 위치에서 `./ccm doctor --fix`를 실행하세요.",
+                  f"The file in the status line command ({script}) is missing, so usage isn't recorded. "
+                  "If you moved the ccm folder, run `./ccm doctor --fix` in the new location."), True
     return None
 
 
@@ -873,12 +952,14 @@ def install_link_problem():
     """PATH의 ccm 명령을 점검한다. 문제가 없으면 None, 있으면 (안내문, `doctor --fix`로 고칠 수 있는지)를 돌려준다."""
     link, here = bin_dir() / "ccm", Path(__file__).resolve()
     if link.is_symlink() and not link.exists():
-        return f"{link} 링크가 가리키는 {os.readlink(link)} 파일이 없습니다", True
+        return tr(f"{link} 링크가 가리키는 {os.readlink(link)} 파일이 없습니다",
+                  f"{link} points to {os.readlink(link)}, which doesn't exist"), True
     found = shutil.which("ccm")
     if not found:
-        return "PATH에서 ccm 명령을 찾지 못했습니다 (`./install.sh`)", False
+        return tr("PATH에서 ccm 명령을 찾지 못했습니다 (`./install.sh`)", "ccm isn't on your PATH (`./install.sh`)"), False
     if Path(found).resolve() != here:
-        return f"PATH의 ccm({found})이 지금 실행한 {here}와 다른 파일입니다", False
+        return tr(f"PATH의 ccm({found})이 지금 실행한 {here}와 다른 파일입니다",
+                  f"ccm on your PATH ({found}) is a different file from the one you ran ({here})"), False
     return None
 
 
@@ -925,7 +1006,8 @@ def shell_function():
     f = shlex.quote(str(ccm_home() / "current-dir"))
     return (
         f"{RC_BEGIN}\n"
-        "# `ccm use <계정>`으로 고른 계정으로 claude를 실행한다. 지우려면 `ccm setup --undo`\n"
+        + tr("# `ccm use <계정>`으로 고른 계정으로 claude를 실행한다. 지우려면 `ccm setup --undo`\n",
+             "# Runs claude with the account chosen by `ccm use <account>`. Remove with `ccm setup --undo`\n") +
         "export CCM_SHELL_HOOK=1\n"
         "claude() {\n"
         f"  if [ -z \"${{CLAUDE_CONFIG_DIR:-}}\" ] && [ -s {f} ]; then\n"
@@ -975,12 +1057,13 @@ def update_locked_json(path, update, dry_run=False):
         except OSError:
             pass
         if time.time() > deadline:
-            raise CcmError(f"{lock} 잠금이 풀리지 않습니다. 잠시 뒤 다시 실행하세요.")
+            raise CcmError(tr(f"{lock} 잠금이 풀리지 않습니다. 잠시 뒤 다시 실행하세요.",
+                              f"{lock} is still locked. Try again in a moment."))
         time.sleep(0.1)
     try:
         data = read_json(path)
         if not isinstance(data, dict):
-            raise CcmError(f"{path}를 JSON으로 읽지 못했습니다.")
+            raise CcmError(tr(f"{path}를 JSON으로 읽지 못했습니다.", f"Could not read {path} as JSON."))
         before = json.dumps(data, sort_keys=True)
         result = update(data)
         if not dry_run and json.dumps(data, sort_keys=True) != before:
@@ -1034,17 +1117,21 @@ def sync_config(src, dst, replace):
 def describe_sync(report):
     added, replaced, kept = report["servers"]
     parts = []
+    pl = lambda n: "" if n == 1 else "s"
     if added:
-        parts.append(f"MCP 서버 {len(added)}개 추가({', '.join(added)})")
+        parts.append(tr(f"MCP 서버 {len(added)}개 추가({', '.join(added)})",
+                        f"{len(added)} MCP server{pl(len(added))} added ({', '.join(added)})"))
     if replaced:
-        parts.append(f"MCP 서버 {len(replaced)}개 덮어씀({', '.join(replaced)})")
+        parts.append(tr(f"MCP 서버 {len(replaced)}개 덮어씀({', '.join(replaced)})",
+                        f"{len(replaced)} MCP server{pl(len(replaced))} replaced ({', '.join(replaced)})"))
     if report["trusted"]:
-        parts.append(f"신뢰한 폴더 {report['trusted']}개")
+        parts.append(tr(f"신뢰한 폴더 {report['trusted']}개", f"{report['trusted']} trusted folder{pl(report['trusted'])}"))
     if report["local"]:
-        parts.append(f"프로젝트별 MCP 서버 {report['local']}개")
-    text = " · ".join(parts) or "바꿀 것 없음"
+        parts.append(tr(f"프로젝트별 MCP 서버 {report['local']}개", f"{report['local']} project MCP server{pl(report['local'])}"))
+    text = " · ".join(parts) or tr("바꿀 것 없음", "nothing to change")
     if kept:
-        text += f" (설정이 달라 그대로 둔 MCP 서버: {', '.join(kept)}. 덮어쓰려면 `--replace`)"
+        text += tr(f" (설정이 달라 그대로 둔 MCP 서버: {', '.join(kept)}. 덮어쓰려면 `--replace`)",
+                   f" (left alone because their settings differ: {', '.join(kept)}; use `--replace` to overwrite)")
     return text
 
 
@@ -1052,7 +1139,8 @@ def sync_profiles(source, targets, replace=False, dry_run=False):
     """source 계정의 .claude.json에서 MCP 서버와 폴더 신뢰 설정을 targets 계정에 복사한다. (계정, 결과) 목록을 돌려준다."""
     src_path = claude_json(source)
     if not src_path.exists():
-        raise CcmError(f"{source} 계정의 {src_path}가 없습니다. 그 계정으로 Claude Code를 한 번 실행한 뒤 다시 하세요.")
+        raise CcmError(tr(f"{source} 계정의 {src_path}가 없습니다. 그 계정으로 Claude Code를 한 번 실행한 뒤 다시 하세요.",
+                          f"{src_path} for account {source} doesn't exist. Run Claude Code once with that account, then try again."))
     src = update_locked_json(src_path, lambda data: data, dry_run=True)
     results = []
     for name in targets:
@@ -1060,7 +1148,7 @@ def sync_profiles(source, targets, replace=False, dry_run=False):
         if name == source:
             continue
         if not path.exists():
-            results.append((name, "아직 Claude Code를 실행하지 않아 건너뜀"))
+            results.append((name, tr("아직 Claude Code를 실행하지 않아 건너뜀", "skipped: Claude Code hasn't been run with this account yet")))
             continue
         report = update_locked_json(path, lambda data: sync_config(src, data, replace), dry_run)
         results.append((name, describe_sync(report)))
@@ -1117,11 +1205,13 @@ def cmd_use(args):
     name = resolve_name(cfg, args.name)
     cfg["current"] = name
     save_config(cfg)
-    label = account_label(cfg, name)
-    print(f"현재 계정: {name}" + (f" ({label})" if label != "확인 전" else ""))
-    print("새로 실행하는 claude부터 적용됩니다. 실행 중인 세션은 종료한 뒤 `claude -c`로 이어서 하세요.")
+    checked = bool(cfg["profiles"][name].get("info"))
+    print(tr("현재 계정", "Current account") + f": {name}" + (f" ({account_label(cfg, name)})" if checked else ""))
+    print(tr("새로 실행하는 claude부터 적용됩니다. 실행 중인 세션은 종료한 뒤 `claude -c`로 이어서 하세요.",
+             "Applies to claude started from now on. Exit running sessions and continue with `claude -c`."))
     if not os.environ.get("CCM_SHELL_HOOK"):
-        print(f"셸 함수가 없어 그냥 `claude`에는 적용되지 않습니다. `ccm setup`을 실행하거나 `ccm run {name}`으로 실행하세요.")
+        print(tr(f"셸 함수가 없어 그냥 `claude`에는 적용되지 않습니다. `ccm setup`을 실행하거나 `ccm run {name}`으로 실행하세요.",
+                 f"Without the shell function, plain `claude` won't use it. Run `ccm setup`, or start with `ccm run {name}`."))
     return 0
 
 
@@ -1139,17 +1229,20 @@ def cmd_next(args):
     now = time.time()
     ranked = rank_accounts(cfg, now, exclude=cfg["current"])
     if not ranked:
-        raise CcmError("바꿀 수 있는 다른 계정이 없습니다. `ccm ls`로 로그인 상태를 확인하세요.")
+        raise CcmError(tr("바꿀 수 있는 다른 계정이 없습니다. `ccm ls`로 로그인 상태를 확인하세요.",
+                          "There is no other account to switch to. Check login status with `ccm ls`."))
     name, rec, limited = ranked[0]
     if limited:
         soon = min(ranked, key=lambda r: available_at(r[1], now) or float("inf"))
         when = available_at(soon[1], now)
-        tail = f" 가장 먼저 풀리는 계정은 {soon[0]}(↻{fmt_clock(when, now)})입니다." if when else ""
-        raise CcmError("다른 계정도 모두 한도에 도달했습니다." + tail)
+        tail = tr(f" 가장 먼저 풀리는 계정은 {soon[0]}(↻{fmt_clock(when, now)})입니다.",
+                  f" {soon[0]} frees up first (↻{fmt_clock(when, now)}).") if when else ""
+        raise CcmError(tr("다른 계정도 모두 한도에 도달했습니다.", "Every other account has hit its limit too.") + tail)
     cfg["current"] = name
     save_config(cfg)
-    ago = f", {fmt_ago(rec['updated_at'], now)} 기록" if rec.get("updated_at") else ""
-    print(f"현재 계정을 {name}(으)로 바꿨습니다: {usage_summary(rec, now)}{ago}")
+    ago = tr(f", {fmt_ago(rec['updated_at'], now)} 기록", f", recorded {fmt_ago(rec['updated_at'], now)}") if rec.get("updated_at") else ""
+    print(tr(f"현재 계정을 {name}(으)로 바꿨습니다: {usage_summary(rec, now)}{ago}",
+             f"Switched to {name}: {usage_summary(rec, now)}{ago}"))
     if args.no_launch:
         return 0
     return launch(name, args.claude_args)
@@ -1158,29 +1251,32 @@ def cmd_next(args):
 def cmd_add(args):
     name = args.name
     if name == DEFAULT or not NAME_RE.match(name):
-        raise CcmError("이름은 영문·숫자·. _ - 로 24자 이내여야 하고 default는 쓸 수 없습니다.")
+        raise CcmError(tr("이름은 영문·숫자·. _ - 로 24자 이내여야 하고 default는 쓸 수 없습니다.",
+                          "Names must use letters, digits, '.', '_' or '-', be at most 24 characters, and not be 'default'."))
     cfg = load_config()
     if name in cfg["profiles"]:
-        raise CcmError(f"{name} 프로필이 이미 있습니다. 다시 로그인하려면 `ccm login {name}`을 쓰세요.")
+        raise CcmError(tr(f"{name} 프로필이 이미 있습니다. 다시 로그인하려면 `ccm login {name}`을 쓰세요.",
+                          f"Profile {name} already exists. To log in again, use `ccm login {name}`."))
     d = profile_dir(name)
     if d.exists():
-        raise CcmError(f"폴더가 이미 있습니다: {d}")
+        raise CcmError(tr(f"폴더가 이미 있습니다: {d}", f"Folder already exists: {d}"))
     d.mkdir(mode=0o700, parents=True)
     share_history = not args.no_share_history
     linked = repair_links(d, share_history, name)
     cfg["profiles"][name] = {"created_at": time.time(), "share_history": share_history}
     save_config(cfg)
-    print(f"프로필 폴더를 만들었습니다: {d}")
-    print(f"~/.claude와 공유하는 항목: {describe_repairs(linked) or '없음'}")
+    print(tr(f"프로필 폴더를 만들었습니다: {d}", f"Created profile folder: {d}"))
+    print(tr("~/.claude와 공유하는 항목", "Shared with ~/.claude") + f": {describe_repairs(linked) or tr('없음', 'none')}")
     code = login_flow(cfg, name, args.email, args.sso)
     if code == 0 and not args.no_sync and claude_json(DEFAULT).exists():
         # 새 계정에서도 default에 등록한 MCP 서버를 쓰고 이미 신뢰한 폴더를 다시 묻지 않게 한다
         try:
             for _, text in sync_profiles(DEFAULT, [name]):
-                print(f"default 계정에서 가져온 설정: {text}")
+                print(tr("default 계정에서 가져온 설정", "Copied from the default account") + f": {text}")
         except (CcmError, OSError) as e:
-            print(f"주의: default 계정의 MCP 서버와 폴더 신뢰 설정을 가져오지 못했습니다({e}). "
-                  f"`ccm sync {name}`으로 다시 시도하세요.")
+            print(tr(f"주의: default 계정의 MCP 서버와 폴더 신뢰 설정을 가져오지 못했습니다({e}). `ccm sync {name}`으로 다시 시도하세요.",
+                     f"Note: could not copy MCP servers and folder trust from the default account ({e}). "
+                     f"Try again with `ccm sync {name}`."))
     return code
 
 
@@ -1193,13 +1289,15 @@ def cmd_rm(args):
     cfg = load_config()
     name = resolve_name(cfg, args.name)
     if name == DEFAULT:
-        raise CcmError("default 프로필은 지울 수 없습니다.")
+        raise CcmError(tr("default 프로필은 지울 수 없습니다.", "The default profile can't be removed."))
     d = profile_dir(name)
     if not args.yes:
-        note = "" if cfg["profiles"][name].get("share_history", True) else " 이 프로필에만 있는 세션 기록도 지워집니다."
-        answer = input(f"{name} 프로필의 로그인 정보와 폴더를 지울까요?{note} [y/N] ")
+        note = "" if cfg["profiles"][name].get("share_history", True) else tr(
+            " 이 프로필에만 있는 세션 기록도 지워집니다.", " Session history kept only in this profile will be deleted too.")
+        answer = input(tr(f"{name} 프로필의 로그인 정보와 폴더를 지울까요?{note} [y/N] ",
+                          f"Remove the login and folder of profile {name}?{note} [y/N] "))
         if answer.strip().lower() not in ("y", "yes"):
-            print("취소했습니다.")
+            print(tr("취소했습니다.", "Cancelled."))
             return 1
     if d.is_dir():
         # 키체인에 남은 이 프로필의 로그인 항목은 Claude Code가 직접 지우게 한다
@@ -1207,14 +1305,15 @@ def cmd_rm(args):
             subprocess.run([claude_bin(), "auth", "logout"], env=profile_env(name),
                            stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
         except (OSError, subprocess.TimeoutExpired) as e:
-            print(f"주의: 로그아웃하지 못했습니다({e}).", file=sys.stderr)
+            print(tr(f"주의: 로그아웃하지 못했습니다({e}).", f"Note: logout failed ({e})."), file=sys.stderr)
         remove_profile_dir(d)
     cfg["profiles"].pop(name)
     if cfg["current"] == name:
         cfg["current"] = DEFAULT
     save_config(cfg)
     usage_path(name).unlink(missing_ok=True)
-    print(f"{name} 프로필을 지웠습니다. 현재 계정: {cfg['current']}")
+    print(tr(f"{name} 프로필을 지웠습니다. 현재 계정: {cfg['current']}",
+             f"Removed profile {name}. Current account: {cfg['current']}"))
     return 0
 
 
@@ -1224,8 +1323,8 @@ def cmd_sync(args):
     targets = [resolve_name(cfg, n) for n in args.names] or [n for n in cfg["profiles"] if n != source]
     for name, text in sync_profiles(source, targets, args.replace, args.dry_run):
         print(f"[{name}] {text}")
-    print("미리 보기만 했고 파일은 바꾸지 않았습니다." if args.dry_run
-          else "실행 중인 세션에는 다시 시작해야 반영됩니다.")
+    print(tr("미리 보기만 했고 파일은 바꾸지 않았습니다.", "Preview only; no files were changed.") if args.dry_run
+          else tr("실행 중인 세션에는 다시 시작해야 반영됩니다.", "Running sessions pick up the changes after a restart."))
     return 0
 
 
@@ -1266,15 +1365,15 @@ def install_statusline():
     settings = read_json(path, None)
     if settings is None:
         if path.exists():
-            raise CcmError(f"{path}를 JSON으로 읽지 못했습니다.")
+            raise CcmError(tr(f"{path}를 JSON으로 읽지 못했습니다.", f"Could not read {path} as JSON."))
         settings = {}
     current = settings.get("statusLine")
     if is_ccm_statusline(current):
         if current.get("command") == statusline_command():
-            return "이미 연결되어 있습니다"
+            return tr("이미 연결되어 있습니다", "already connected")
         current["command"] = statusline_command()
         write_json(path, settings, 0o644)
-        return "명령 경로를 갱신했습니다"
+        return tr("명령 경로를 갱신했습니다", "updated the command path")
     write_json(ccm_home() / "statusline-prev.json", {"statusLine": current})
     if path.exists():
         backup = path.with_name(f"settings.json.ccm-backup-{time.strftime('%Y%m%d-%H%M%S')}")
@@ -1283,15 +1382,15 @@ def install_statusline():
     new.update(type="command", command=statusline_command())
     settings["statusLine"] = new
     write_json(path, settings, 0o644)
-    kept = " (기존 상태줄 출력 뒤에 붙습니다)" if (current or {}).get("command") else ""
-    return f"연결했습니다{kept}"
+    kept = tr(" (기존 상태줄 출력 뒤에 붙습니다)", " (shown after your existing status line)") if (current or {}).get("command") else ""
+    return tr("연결했습니다", "connected") + kept
 
 
 def uninstall_statusline():
     path = settings_path()
     settings = read_json(path, None)
     if not settings or not is_ccm_statusline(settings.get("statusLine")):
-        return "연결되어 있지 않습니다"
+        return tr("연결되어 있지 않습니다", "not connected")
     prev_path = ccm_home() / "statusline-prev.json"
     old = (read_json(prev_path, {}) or {}).get("statusLine")
     if old:
@@ -1300,7 +1399,7 @@ def uninstall_statusline():
         settings.pop("statusLine", None)
     write_json(path, settings, 0o644)
     prev_path.unlink(missing_ok=True)
-    return "이전 설정으로 되돌렸습니다"
+    return tr("이전 설정으로 되돌렸습니다", "restored the previous setting")
 
 
 def install_shell_hook():
@@ -1309,12 +1408,12 @@ def install_shell_hook():
     if RC_BEGIN in text:
         new = strip_rc_block(text)
         new = new + ("" if not new or new.endswith("\n") else "\n") + "\n" + shell_function()
-        status = "갱신했습니다"
+        status = tr("갱신했습니다", "updated")
     else:
         new = text + ("" if not text or text.endswith("\n") else "\n") + "\n" + shell_function()
-        status = "추가했습니다"
+        status = tr("추가했습니다", "added")
     if new == text:
-        return "이미 설치되어 있습니다"
+        return tr("이미 설치되어 있습니다", "already installed")
     write_text(rc, new, 0o644)
     return status
 
@@ -1322,26 +1421,29 @@ def install_shell_hook():
 def uninstall_shell_hook():
     rc = rc_file()
     if not rc.exists():
-        return "설치되어 있지 않습니다"
+        return tr("설치되어 있지 않습니다", "not installed")
     text = rc.read_text(encoding="utf-8")
     if RC_BEGIN not in text:
-        return "설치되어 있지 않습니다"
+        return tr("설치되어 있지 않습니다", "not installed")
     write_text(rc, strip_rc_block(text), 0o644)
-    return "지웠습니다"
+    return tr("지웠습니다", "removed")
 
 
 def cmd_setup(args):
     rc = rc_file()
+    sl, fn = tr("상태줄", "Status line"), tr("셸 함수", "Shell function")
     if args.undo:
-        print(f"상태줄: {uninstall_statusline()}")
-        print(f"셸 함수({rc}): {uninstall_shell_hook()}")
+        print(f"{sl}: {uninstall_statusline()}")
+        print(f"{fn} ({rc}): {uninstall_shell_hook()}")
         return 0
-    print(f"상태줄({settings_path()}): {install_statusline()}")
+    print(f"{sl} ({settings_path()}): {install_statusline()}")
     if args.no_shell:
-        print("셸 함수는 설치하지 않았습니다. 직접 넣으려면 `ccm shell-init` 출력을 셸 설정 파일에 붙이세요.")
+        print(tr("셸 함수는 설치하지 않았습니다. 직접 넣으려면 `ccm shell-init` 출력을 셸 설정 파일에 붙이세요.",
+                 "Shell function not installed. To add it yourself, paste the output of `ccm shell-init` into your shell config."))
     else:
-        print(f"셸 함수({rc}): {install_shell_hook()}")
-        print(f"새 터미널을 열거나 `source {rc}`를 실행하면 `claude`가 현재 계정으로 실행됩니다.")
+        print(f"{fn} ({rc}): {install_shell_hook()}")
+        print(tr(f"새 터미널을 열거나 `source {rc}`를 실행하면 `claude`가 현재 계정으로 실행됩니다.",
+                 f"Open a new terminal or run `source {rc}`, and `claude` will start with the current account."))
     return 0
 
 
@@ -1362,29 +1464,32 @@ def cmd_doctor(args):
         print(f"{'✓' if ok else '!'} {text}")
 
     exe = claude_bin()
-    report(bool(shutil.which(exe)), f"claude 실행 파일: {shutil.which(exe) or '찾지 못함'}")
+    report(bool(shutil.which(exe)), tr("claude 실행 파일", "claude executable") + f": {shutil.which(exe) or tr('찾지 못함', 'not found')}")
     notice = override_notice()
     if notice:
         report(False, notice)
     if os.environ.get("CLAUDE_CONFIG_DIR"):
-        report(False, "현재 셸에 CLAUDE_CONFIG_DIR이 설정되어 있어 셸 함수가 계정을 바꾸지 않습니다")
+        report(False, tr("현재 셸에 CLAUDE_CONFIG_DIR이 설정되어 있어 셸 함수가 계정을 바꾸지 않습니다",
+                         "CLAUDE_CONFIG_DIR is set in this shell, so the shell function won't switch accounts"))
     link = install_link_problem()
     if link and link[1] and args.fix:
         relink_install()
-        print(f"  · ccm 링크를 다시 만들었습니다: {bin_dir() / 'ccm'} -> {Path(__file__).resolve()}")
+        print("  · " + tr("ccm 링크를 다시 만들었습니다", "recreated the ccm link") + f": {bin_dir() / 'ccm'} -> {Path(__file__).resolve()}")
         link = install_link_problem()
+    cmd_label = tr("ccm 명령", "ccm command")
     if link:
-        report(False, f"ccm 명령: {link[0]}" + (" (`./ccm doctor --fix`)" if link[1] else ""))
+        report(False, f"{cmd_label}: {link[0]}" + (" (`./ccm doctor --fix`)" if link[1] else ""))
     else:
-        report(True, f"ccm 명령: {shutil.which('ccm')}")
+        report(True, f"{cmd_label}: {shutil.which('ccm')}")
     sl = statusline_problem()
     if sl and sl[1] and args.fix:
-        print(f"  · 상태줄 명령: {install_statusline()}")
+        print("  · " + tr("상태줄 명령", "status line command") + f": {install_statusline()}")
         sl = statusline_problem()
-    report(sl is None, "상태줄 연결" if sl is None else sl[0])
+    report(sl is None, tr("상태줄 연결", "status line connected") if sl is None else sl[0])
     rc = rc_file()
     hooked = rc.exists() and RC_BEGIN in rc.read_text(encoding="utf-8")
-    report(hooked, f"셸 함수 {rc}" + ("" if hooked else " 에 없음 (`ccm setup`)"))
+    report(hooked, tr(f"셸 함수 {rc}" + ("" if hooked else " 에 없음 (`ccm setup`)"),
+                      f"shell function in {rc}" if hooked else f"shell function not found in {rc} (`ccm setup`)"))
     seen = {}
     for name, p in cfg["profiles"].items():
         label = account_label(cfg, name)
@@ -1393,91 +1498,136 @@ def cmd_doctor(args):
         key = (info.get("email"), info.get("orgName"))
         if info.get("email"):
             if key in seen:
-                report(False, f"[{name}] {seen[key]} 프로필과 같은 계정입니다")
+                report(False, tr(f"[{name}] {seen[key]} 프로필과 같은 계정입니다", f"[{name}] same account as {seen[key]}"))
             seen.setdefault(key, name)
         if name == DEFAULT or not profile_dir(name).is_dir():
             continue
         if args.fix:
             done = repair_links(profile_dir(name), p.get("share_history", True), name)
             if done:
-                print(f"  · 다시 연결했습니다: {describe_repairs(done)}")
+                print("  · " + tr("다시 연결했습니다", "relinked") + f": {describe_repairs(done)}")
         for item, problem, fixable in link_problems(cfg, name):
             hint = " (`ccm doctor --fix`)" if fixable else ""
             report(False, f"[{name}] {item}: {problem}{hint}")
-    print("문제 없음" if warn == 0 else f"확인할 항목 {warn}개")
+    print(tr("문제 없음", "No problems found") if warn == 0 else tr(f"확인할 항목 {warn}개", f"{warn} item{'s' if warn != 1 else ''} to check"))
     return 0 if warn == 0 else 1
+
+
+def cmd_lang(args):
+    global _LANG
+    if args.value:
+        cfg = load_config()
+        if args.value == "auto":
+            cfg.pop("lang", None)
+        else:
+            cfg["lang"] = args.value
+        save_config(cfg)
+        _LANG = None
+    lang, source = detect_lang()
+    _LANG = lang
+    why = {"CCM_LANG": tr("환경변수 CCM_LANG", "CCM_LANG environment variable"),
+           "saved": tr("`ccm lang`으로 저장한 값", "saved with `ccm lang`"),
+           "macOS": tr("macOS 시스템 언어", "macOS system language"),
+           "system": tr("로캘과 시스템 언어가 한국어가 아님", "locale and system language are not Korean")}.get(
+               source, tr(f"로캘 {source}", f"locale {source}"))
+    print(tr("출력 언어", "Output language") + f": {LANG_NAMES[lang]} ({why})")
+    if args.value and args.value != "auto" and source == "CCM_LANG" and lang != args.value:
+        print(tr("환경변수 CCM_LANG이 저장한 값보다 먼저 쓰입니다.", "The CCM_LANG environment variable takes precedence over the saved value."))
+    return 0
 
 
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ccm",
-        description="Claude Code 계정 프로필 관리: 계정별 사용량을 보고 바로 전환합니다. "
-                    "인자 없이 실행하면 사용량 표에서 방향키로 계정을 골라 claude를 실행합니다.")
+        description=tr("Claude Code 계정 프로필 관리: 계정별 사용량을 보고 바로 전환합니다. "
+                       "인자 없이 실행하면 사용량 표에서 방향키로 계정을 골라 claude를 실행합니다.",
+                       "Manage Claude Code account profiles: see usage per account and switch right away. "
+                       "Run without arguments to pick an account from the usage table with the arrow keys and start claude."))
     ap.add_argument("--version", action="version", version=f"ccm {VERSION}")
-    sub = ap.add_subparsers(dest="cmd", metavar="명령")
+    sub = ap.add_subparsers(dest="cmd", metavar=tr("명령", "command"))
+    no_launch = tr("계정만 바꾸고 claude는 실행하지 않음", "switch only; don't start claude")
+    name_help = tr("이름, 번호, 이메일 일부", "name, number, or part of the email")
 
-    p = sub.add_parser("pick", help="사용량 표를 보고 계정을 골라 claude 실행 (기본 명령)")
-    p.add_argument("-n", "--no-launch", action="store_true", help="계정만 바꾸고 claude는 실행하지 않음")
+    p = sub.add_parser("pick", help=tr("사용량 표를 보고 계정을 골라 claude 실행 (기본 명령)",
+                                       "pick an account from the usage table and start claude (default)"))
+    p.add_argument("-n", "--no-launch", action="store_true", help=no_launch)
     p.set_defaults(func=cmd_pick)
 
-    p = sub.add_parser("ls", help="계정별 로그인 상태와 사용량 표시")
-    p.add_argument("--json", action="store_true", help="JSON으로 출력")
+    p = sub.add_parser("ls", help=tr("계정별 로그인 상태와 사용량 표시", "show login status and usage per account"))
+    p.add_argument("--json", action="store_true", help=tr("JSON으로 출력", "print as JSON"))
     p.set_defaults(func=cmd_ls)
 
-    p = sub.add_parser("use", help="현재 계정 바꾸기 (셸 함수가 있으면 claude에 바로 적용)")
-    p.add_argument("name", help="이름, 번호, 이메일 일부")
+    p = sub.add_parser("use", help=tr("현재 계정 바꾸기 (셸 함수가 있으면 claude에 바로 적용)",
+                                      "change the current account (applies to claude via the shell function)"))
+    p.add_argument("name", help=name_help)
     p.set_defaults(func=cmd_use)
 
-    p = sub.add_parser("run", help="지정한 계정으로 claude 한 번 실행 (현재 계정은 그대로)")
-    p.add_argument("name")
+    p = sub.add_parser("run", help=tr("지정한 계정으로 claude 한 번 실행 (현재 계정은 그대로)",
+                                      "start claude once with an account (current account unchanged)"))
+    p.add_argument("name", help=name_help)
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("next", help="여유가 가장 많은 다른 계정으로 바꾸고 claude 실행 (예: ccm next -c)")
-    p.add_argument("-n", "--no-launch", action="store_true", help="계정만 바꾸고 claude는 실행하지 않음")
+    p = sub.add_parser("next", help=tr("여유가 가장 많은 다른 계정으로 바꾸고 claude 실행 (예: ccm next -c)",
+                                       "switch to the other account with the most headroom and start claude (e.g. ccm next -c)"))
+    p.add_argument("-n", "--no-launch", action="store_true", help=no_launch)
     p.set_defaults(func=cmd_next)
 
-    p = sub.add_parser("add", help="새 계정 프로필을 만들고 로그인")
-    p.add_argument("name", help="프로필 이름 (예: work)")
-    p.add_argument("--email", help="로그인 화면에 미리 넣을 이메일")
-    p.add_argument("--sso", action="store_true", help="SSO 로그인 사용")
+    p = sub.add_parser("add", help=tr("새 계정 프로필을 만들고 로그인", "create a new account profile and log in"))
+    p.add_argument("name", help=tr("프로필 이름 (예: work)", "profile name (e.g. work)"))
+    p.add_argument("--email", help=tr("로그인 화면에 미리 넣을 이메일", "email to pre-fill on the login page"))
+    p.add_argument("--sso", action="store_true", help=tr("SSO 로그인 사용", "use SSO login"))
     p.add_argument("--no-share-history", action="store_true",
-                   help="세션 기록을 공유하지 않음 (계정 전환 후 claude -c로 이어서 하기 불가)")
+                   help=tr("세션 기록을 공유하지 않음 (계정 전환 후 claude -c로 이어서 하기 불가)",
+                           "don't share session history (claude -c can't continue across accounts)"))
     p.add_argument("--no-sync", action="store_true",
-                   help="default 계정의 MCP 서버와 폴더 신뢰 설정을 가져오지 않음")
+                   help=tr("default 계정의 MCP 서버와 폴더 신뢰 설정을 가져오지 않음",
+                           "don't copy MCP servers and folder trust from the default account"))
     p.set_defaults(func=cmd_add)
 
-    p = sub.add_parser("sync", help="한 계정의 MCP 서버와 폴더 신뢰 설정을 다른 계정에 복사")
-    p.add_argument("names", nargs="*", metavar="이름", help="받을 계정 (생략하면 가져올 계정을 뺀 전부)")
-    p.add_argument("--from", dest="source", default=DEFAULT, metavar="이름", help="가져올 계정 (기본 default)")
-    p.add_argument("--replace", action="store_true", help="이름이 같고 설정이 다른 MCP 서버를 덮어씀")
-    p.add_argument("--dry-run", action="store_true", help="바꿀 내용만 보여 주고 파일은 바꾸지 않음")
+    p = sub.add_parser("sync", help=tr("한 계정의 MCP 서버와 폴더 신뢰 설정을 다른 계정에 복사",
+                                       "copy MCP servers and folder trust from one account to others"))
+    p.add_argument("names", nargs="*", metavar=tr("이름", "name"),
+                   help=tr("받을 계정 (생략하면 가져올 계정을 뺀 전부)", "target accounts (default: all except the source)"))
+    p.add_argument("--from", dest="source", default=DEFAULT, metavar=tr("이름", "name"),
+                   help=tr("가져올 계정 (기본 default)", "source account (default: default)"))
+    p.add_argument("--replace", action="store_true",
+                   help=tr("이름이 같고 설정이 다른 MCP 서버를 덮어씀", "overwrite MCP servers with the same name but different settings"))
+    p.add_argument("--dry-run", action="store_true",
+                   help=tr("바꿀 내용만 보여 주고 파일은 바꾸지 않음", "show what would change without changing files"))
     p.set_defaults(func=cmd_sync)
 
-    p = sub.add_parser("login", help="기존 프로필에 다시 로그인")
-    p.add_argument("name")
-    p.add_argument("--email")
-    p.add_argument("--sso", action="store_true")
+    p = sub.add_parser("login", help=tr("기존 프로필에 다시 로그인", "log in to an existing profile again"))
+    p.add_argument("name", help=name_help)
+    p.add_argument("--email", help=tr("로그인 화면에 미리 넣을 이메일", "email to pre-fill on the login page"))
+    p.add_argument("--sso", action="store_true", help=tr("SSO 로그인 사용", "use SSO login"))
     p.set_defaults(func=cmd_login)
 
-    p = sub.add_parser("rm", help="프로필 삭제 (로그아웃 후 폴더 삭제)")
-    p.add_argument("name")
-    p.add_argument("-y", "--yes", action="store_true", help="확인 없이 삭제")
+    p = sub.add_parser("rm", help=tr("프로필 삭제 (로그아웃 후 폴더 삭제)", "remove a profile (log out, then delete its folder)"))
+    p.add_argument("name", help=name_help)
+    p.add_argument("-y", "--yes", action="store_true", help=tr("확인 없이 삭제", "don't ask for confirmation"))
     p.set_defaults(func=cmd_rm)
 
-    p = sub.add_parser("setup", help="상태줄 연결과 셸 함수 설치 (--undo로 되돌리기)")
-    p.add_argument("--undo", action="store_true")
-    p.add_argument("--no-shell", action="store_true", help="셸 함수는 설치하지 않음")
+    p = sub.add_parser("setup", help=tr("상태줄 연결과 셸 함수 설치 (--undo로 되돌리기)",
+                                        "connect the status line and install the shell function (--undo to revert)"))
+    p.add_argument("--undo", action="store_true", help=tr("설치 전 상태로 되돌리기", "revert to the state before setup"))
+    p.add_argument("--no-shell", action="store_true", help=tr("셸 함수는 설치하지 않음", "don't install the shell function"))
     p.set_defaults(func=cmd_setup)
 
-    p = sub.add_parser("doctor", help="설정 점검")
-    p.add_argument("--fix", action="store_true", help="빠진 공유 링크, ccm 링크, 상태줄 명령 경로를 다시 연결")
+    p = sub.add_parser("doctor", help=tr("설정 점검", "check the setup"))
+    p.add_argument("--fix", action="store_true", help=tr("빠진 공유 링크, ccm 링크, 상태줄 명령 경로를 다시 연결",
+                                                         "relink missing shared items, the ccm link and the status line command"))
     p.set_defaults(func=cmd_doctor)
 
-    p = sub.add_parser("statusline", help="Claude Code 상태줄 명령 (setup이 등록)")
-    p.add_argument("--wrap", help="함께 실행할 기존 상태줄 명령")
+    p = sub.add_parser("lang", help=tr("출력 언어 보기·바꾸기 (ko, en, auto)", "show or set the output language (ko, en, auto)"))
+    p.add_argument("value", nargs="?", choices=["ko", "en", "auto"],
+                   help=tr("auto는 저장한 값을 지우고 로캘·시스템 언어를 따름", "auto removes the saved value and follows the locale and system language"))
+    p.set_defaults(func=cmd_lang)
+
+    p = sub.add_parser("statusline", help=tr("Claude Code 상태줄 명령 (setup이 등록)", "Claude Code status line command (registered by setup)"))
+    p.add_argument("--wrap", help=tr("함께 실행할 기존 상태줄 명령", "existing status line command to run as well"))
     p.set_defaults(func=cmd_statusline)
 
-    p = sub.add_parser("shell-init", help="셸 함수 출력")
+    p = sub.add_parser("shell-init", help=tr("셸 함수 출력", "print the shell function"))
     p.set_defaults(func=cmd_shell_init)
     return ap
 

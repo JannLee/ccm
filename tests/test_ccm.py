@@ -131,6 +131,7 @@ class CcmTest(unittest.TestCase):
             CCM_CLAUDE_HOME=str(self.claude_home),
             CCM_CLAUDE_BIN=str(fake),
             CCM_BIN_DIR=str(self.local_bin),
+            CCM_LANG="ko",   # 기존 테스트는 한국어 출력을 확인한다. 영어 출력은 따로 확인한다
             HOME=str(self.home),
             SHELL="/bin/zsh",
             FAKE_CLAUDE_LOG=str(self.log),
@@ -660,6 +661,63 @@ class CcmTest(unittest.TestCase):
         self.assertTrue((d / "CLAUDE.md").is_symlink())
 
 
+    # ---------- 출력 언어 ----------
+
+    def env_en(self):
+        return {**self.env, "CCM_LANG": "en"}
+
+    def test_english_output(self):
+        en = self.env_en()
+        r = self.ccm("add", "work", "--email", "w@example.com", env=en)
+        self.assertIn("Logged in: work → w@example.com", r.stdout)
+        self.ccm("add", "side", "--email", "s@example.com", env=en)
+        now = time.time()
+        self.write_usage("work", {"five_hour": {"used_percentage": 100.0, "resets_at": now + 600},
+                                  "seven_day": {"used_percentage": 40.0, "resets_at": now - 60}})
+        out = self.ccm("ls", env=en).stdout
+        self.assertIn("Claude Code accounts · current: default", out)
+        for word in ("name", "account", "plan", "5-hour", "weekly", "updated", "login required"):
+            self.assertIn(word, out)
+        work = next(line for line in out.splitlines() if "2  work" in line)
+        self.assertIn("LIMIT", work)
+        self.assertIn("reset", work)
+        self.assertIn("no data", next(line for line in out.splitlines() if "3  side" in line))
+        self.assertIn("Most headroom: 3 side (no data) · switch with `ccm next`", out)
+        self.assertNotRegex(out, "[가-힣]")
+        self.assertIn("No account matches 'nope'", self.ccm("use", "nope", env=en, code=1).stderr)
+        self.assertIn("Switched to side: no data", self.ccm("next", "-n", env=en).stdout)
+        doctor = self.ccm("doctor", env=en, code=None).stdout
+        self.assertIn("claude executable", doctor)
+        self.assertNotRegex(doctor, "[가-힣]")
+        self.assertIn("Manage Claude Code account profiles", self.ccm("--help", env=en).stdout)
+
+    def test_language_follows_env_saved_value_and_locale(self):
+        base = {k: v for k, v in self.env.items() if k not in ("CCM_LANG", "LC_ALL", "LC_MESSAGES", "LANG")}
+        ko_locale, en_locale = {**base, "LANG": "ko_KR.UTF-8"}, {**base, "LANG": "en_US.UTF-8"}
+        self.assertIn("출력 언어: 한국어 (로캘 LANG)", self.ccm("lang", env=ko_locale).stdout)
+        # 로캘이 ko 가 아니고 시스템 언어도 한국어가 아니면(테스트 HOME 에는 macOS 설정이 없다) 영어
+        self.assertIn("Output language: English", self.ccm("lang", env=en_locale).stdout)
+        # 저장한 값이 로캘보다 먼저 쓰인다
+        self.assertIn("한국어 (`ccm lang`으로 저장한 값)", self.ccm("lang", "ko", env=en_locale).stdout)
+        self.assertEqual(self.config()["lang"], "ko")
+        self.assertIn("Claude Code 계정 · 현재 default", self.ccm("ls", env=en_locale).stdout)
+        # CCM_LANG 이 저장한 값보다 먼저 쓰인다
+        self.assertIn("English (CCM_LANG environment variable)", self.ccm("lang", env={**en_locale, "CCM_LANG": "en"}).stdout)
+        self.ccm("lang", "auto", env=en_locale)
+        self.assertNotIn("lang", self.config())
+        self.assertIn("Claude Code accounts", self.ccm("ls", env=en_locale).stdout)
+
+    def test_pick_in_english(self):
+        self.ccm("add", "work", env=self.env_en())
+        s = PtySession([], self.env_en())
+        s.expect("↑↓ move · Enter launch · Esc quit")
+        s.send(b"\x1b[B")
+        s.expect_row("2  work")
+        s.send(b"\r")
+        s.expect("→ Launching claude as work.")
+        s.close()
+        self.assertEqual(self.calls()[-1]["config_dir"], str(self.pdir("work")))
+
     # ---------- 설정 복사 ----------
 
     def test_sync_keeps_different_servers_unless_replace(self):
@@ -722,6 +780,16 @@ class HelperTest(unittest.TestCase):
                          {"five_hour": {"used_percentage": 5.0, "resets_at": 100.0}})
         self.assertEqual(self.m.extract_windows({"rate_limits": None}), {})
         self.assertEqual(self.m.extract_windows([]), {})
+
+    def test_tr_follows_language(self):
+        old = self.m._LANG
+        try:
+            self.m._LANG = "en"
+            self.assertEqual(self.m.fmt_ago(0, 7200), "2h ago")
+            self.m._LANG = "ko"
+            self.assertEqual(self.m.fmt_ago(0, 7200), "2시간 전")
+        finally:
+            self.m._LANG = old
 
     def test_strip_rc_block(self):
         block = self.m.shell_function()

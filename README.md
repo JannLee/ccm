@@ -1,189 +1,329 @@
-# ccm: Claude Code 계정별 사용량 확인과 전환
+# ccm
 
-여러 Claude Code 계정에 미리 로그인해 두고, 계정마다 5시간·주간 사용률을 표로 본 뒤 방향키로 계정을 골라 그 계정으로 `claude`를 실행합니다.
+**English** · [한국어](README.ko.md)
+
+A command-line tool for people who use several Claude Code accounts: see how much usage each account has left on one screen, and switch to the one with the most headroom.
+
+<p align="center">
+  <img src="docs/media/ccm-intro-en.gif" alt="15-second intro: an account hits 100% and the word 'limit' drops onto the usage bar, its letters rearrange into 'switch', ccm picks the account with the most headroom, and the same conversation continues" width="100%">
+</p>
+
+<p align="center"><a href="docs/media/ccm-intro-en.mp4">Watch with sound (MP4, 15 s)</a></p>
+
+ccm prints in English, or in Korean when your locale or macOS system language is Korean. See [Output language](#output-language) to change it.
+
+## When you need it
+
+- Claude Code stopped in the middle of your work because you hit a usage limit.
+- You have several accounts, but the only way to find one with room left is to log in to each.
+- Switching to another account means explaining your task from scratch again.
+
+ccm takes care of all three.
+
+1. **Usage per account, in one table.** The 5-hour and weekly usage of every account, and when each one resets.
+2. **Switch without logging out.** Log in to each account once. Pick one in the table with the arrow keys and ccm starts `claude` with it.
+3. **Keep the conversation.** Conversation history, settings and skills are shared across accounts. When you hit a limit, `ccm next -c` moves to the account with the most headroom and reopens your last conversation.
+
+ccm never reads or copies your login tokens. Logging in is done by Claude Code's own `claude auth login`; ccm only points Claude Code at a separate config folder for each account.
+
+## Install
+
+### Requirements
+
+| You need | Check with |
+| --- | --- |
+| macOS (tested) or Linux (not tested). Windows is not supported | |
+| Python 3.8 or later | `python3 --version` |
+| Claude Code, installed and logged in | `claude --version` |
+| zsh or bash | `echo $SHELL` |
+
+If you don't have Claude Code yet, follow the [official setup guide](https://docs.anthropic.com/en/docs/claude-code/setup) and log in once. ccm uses only the Python standard library, so there is nothing else to install.
+
+### Step 1. Download
+
+Put ccm in a folder where it can stay. If you move the folder later you'll have to reconnect it (see the FAQ), so pick the place first.
+
+```sh
+git clone https://github.com/revfactory/ccm.git ~/ccm
+cd ~/ccm
+```
+
+### Step 2. Install the `ccm` command
+
+```sh
+./install.sh
+```
+
+This creates a link at `~/.local/bin/ccm`. If it warns that `~/.local/bin` is not on your PATH, add it to your shell config:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # ~/.bashrc for bash
+source ~/.zshrc
+```
+
+### Step 3. Connect the status line and the shell function
+
+```sh
+ccm setup
+source ~/.zshrc   # source ~/.bashrc for bash, or open a new terminal
+```
+
+This sets up two things.
+
+- **Status line**: the status line at the bottom of Claude Code records each account's usage. If you already had a status line it keeps showing, followed by something like `[work] 5h 72% ↻16:26 · 7d 31%`.
+- **Shell function**: typing plain `claude` starts the account you picked in ccm.
+
+Before changing `~/.claude/settings.json`, ccm saves a backup next to it (`settings.json.ccm-backup-<time>`). Run `ccm setup --undo` to revert.
+
+### Step 4. Add your accounts
+
+The account you have been using so far is already registered as `default`. Give each other account a name and add it:
+
+```sh
+ccm add work
+ccm add side --email side@example.com   # pre-fill the email on the login page
+```
+
+A browser window opens; log in with the account you want under that name. When it finishes, ccm shows which email you logged in with.
+
+- If your browser is already logged in to another account, that account may be approved as-is. Log out in the browser first, or open the login URL printed in the terminal in a private window.
+- ccm warns you if the account is one you have already registered.
+- MCP servers and trusted folders from the `default` account are copied to the new account, so Claude Code won't ask you to trust those folders again. Add `--no-sync` to skip this.
+
+### Step 5. Run each account once
+
+Usage is recorded by the status line while you use Claude Code. For each account you added, start it once, send one message, wait for the reply and exit.
+
+```sh
+ccm run work
+```
+
+On the first run Claude Code may ask you to pick a theme again.
+
+### Step 6. Check
+
+```sh
+ccm doctor
+```
+
+If every line starts with `✓`, you are done. Lines that start with `!` explain what to fix; `ccm doctor --fix` repairs missing links.
+
+## Usage
+
+### Pick an account from the table: `ccm`
 
 ```text
 $ ccm
-Claude Code 계정 · 현재 default · 15:27 기준
-      #  이름     계정                       요금제  5시간 사용              주간 사용                   기록
-   ●  1  default  me@gmail.com               Max     ████████  97% ↻16:57    █████░░░  64% ↻10/22 15:27  2분 전
-❯     2  work     robin@company-example.com  Max     ░░░░░░░░   0% 초기화됨  ███░░░░░  41% ↻10/24 15:27  3시간 전
-      3  side     side@example.org           Max     기록 없음               기록 없음                   -
-사용량은 각 계정으로 Claude Code를 쓸 때 상태줄이 받은 마지막 값이며, 초기화 시각이 지난 창은 0%로 표시합니다.
-여유가 가장 많은 다른 계정: 3 side (기록 없음)
-↑↓ 이동 · Enter 실행 · ESC 종료
+Claude Code accounts · current: default · 15:27
+      #  name     account             plan  5-hour                      weekly                      updated
+   ●  1  default  me@gmail.com        Max   ████████ 100% LIMIT ↻16:57  █████░░░  64% ↻10/30 15:57  2m ago
+      2  work     me@company.example  Max   ███░░░░░  38% ↻17:40        ███░░░░░  41% ↻10/29 15:27  3h ago
+❯     3  side     side@example.org    Pro   █░░░░░░░  12% ↻18:47        █░░░░░░░   9% ↻10/31 15:27  1d ago
+Usage is the last value each account's status line received; windows past their reset time show 0%.
+Most headroom: 3 side (5h 12% · weekly 9%)
+↑↓ move · Enter launch · Esc quit
 ```
 
-`●`는 현재 계정이고, `❯`와 반전색으로 강조한 행이 커서 위치입니다. 사용률이 100%에 도달한 창에는 `한도`가 붙습니다. 표 아래에는 현재 계정을 뺀 계정 가운데 여유가 가장 많은 계정을 번호와 함께 보여 줍니다(아래 "여유가 많은 계정 고르기" 참고).
-
-| 키 | 동작 |
+| Key | Action |
 | --- | --- |
-| ↑ ↓ (또는 k j) | 커서 이동. 맨 아래에서 ↓를 누르면 맨 위로 갑니다 |
-| 1\~9 | 그 번호의 계정으로 커서 이동 |
-| Enter | 커서가 있는 계정으로 바꾸고 `claude` 실행 (`ccm -n`이면 계정만 바꿈) |
-| ESC (또는 q) | 종료할지 묻습니다. y나 Enter를 누르면 종료하고, n이나 ESC를 누르면 선택 화면으로 돌아갑니다 |
-| Ctrl+C | 묻지 않고 바로 종료 |
+| ↑ ↓ (or k j) | Move the cursor. ↓ on the last row wraps to the top |
+| 1\~9 | Jump to that account number |
+| Enter | Switch to the account under the cursor and start `claude` |
+| Esc (or q) | Asks whether to quit. y or Enter quits; n or Esc goes back to the table |
+| Ctrl+C | Quit immediately |
 
-## 동작 방식
+### When you hit a limit: `ccm next -c`
 
-- **계정마다 설정 폴더를 따로 둡니다.** Claude Code 문서가 안내하는 다중 계정 방식(`CLAUDE_CONFIG_DIR`)을 그대로 씁니다. 원래 쓰던 `~/.claude`는 `default` 계정이고, 추가한 계정은 `~/.ccm/profiles/<이름>/`을 씁니다.
-- **로그인은 Claude Code가 처리합니다.** `ccm add`가 해당 폴더를 지정해 `claude auth login`을 실행합니다. 로그인 정보는 Claude Code가 폴더별로 키체인에 저장하고, ccm은 토큰을 읽거나 옮기지 않습니다.
-- **사용량은 상태줄에서 기록합니다.** Claude Code는 상태줄 명령에 `rate_limits`(5시간·주간 사용률과 초기화 시각)를 넘겨줍니다. `ccm setup`이 상태줄 명령을 ccm으로 바꾸고, ccm은 이 값을 계정별 파일에 저장합니다. 원래 쓰던 상태줄 명령도 계속 실행되고, 그 출력 뒤에 `[work] 5h 72% ↻16:26 · 7d 31% ↻10/22 15:26`이 붙습니다.
-- **설정과 작업 기록은 계정끼리 공유합니다.** 추가한 계정 폴더에 `~/.claude`의 설정·스킬·플러그인·세션 기록·작업 목록을 심볼릭 링크로 연결합니다. 그래서 같은 프로젝트에서 계정을 바꿔도 이전 작업을 그대로 이어 갈 수 있습니다. 자세한 내용은 아래 "계정을 바꿔도 이어지는 작업"에 있습니다.
-
-## 설치
+1. Exit the Claude Code session that hit the limit with `/exit`.
+2. Run:
 
 ```sh
-./install.sh      # ~/.local/bin/ccm 링크 생성
-ccm setup         # 상태줄 연결 + ~/.zshrc에 claude 셸 함수 추가
-source ~/.zshrc   # 또는 새 터미널 열기
+ccm next -c
 ```
 
-`ccm setup`은 `~/.claude/settings.json`을 고치기 전에 같은 폴더에 `settings.json.ccm-backup-<시각>` 백업을 만듭니다. `ccm setup --undo`를 실행하면 상태줄 설정과 셸 함수가 설치 전 상태로 돌아갑니다.
+ccm switches to the account with the most headroom (other than the current one) and reopens the last conversation in the same project. `-c` is passed to `claude` as is (continue the previous conversation). How the account is chosen is described under "How ccm picks the account with the most headroom" below.
 
-Python 3.8 이상만 있으면 되고, 따로 설치할 패키지는 없습니다.
+Sessions that are already running keep their account. The new account applies to `claude` processes started after the switch.
 
-### ccm 폴더를 옮긴 경우
+### Common commands
 
-상태줄 명령은 `~/.local/bin/ccm` 링크를 거쳐 이 폴더의 `ccm` 파일을 실행합니다. 폴더를 옮기거나 이름을 바꾸면 링크가 가리키는 파일이 없어집니다. 이때 Claude Code는 오류를 보여 주지 않고 상태줄을 비워 두며, 사용량 기록도 멈춥니다. 새 위치에서 아래 둘 중 하나를 실행하세요.
+| To do this | Run |
+| --- | --- |
+| Pick from the table and start `claude` | `ccm` |
+| Pick from the table and continue the last conversation | `ccm -- -c` |
+| Switch to the account with the most headroom and continue | `ccm next -c` |
+| Switch only (applies to the next `claude`) | `ccm use work` or `ccm use 2`; from the table, `ccm -n` |
+| Run another account once, keeping the current one | `ccm run side -c` |
+| Show the table / as JSON | `ccm ls`, `ccm ls --json` |
+| Add / re-login / remove an account | `ccm add work`, `ccm login work`, `ccm rm side` |
+| Copy MCP servers and trusted folders from default to other accounts | `ccm sync` (preview: `ccm sync --dry-run`) |
+| Check and repair the setup | `ccm doctor`, `ccm doctor --fix` |
+| Show or set the output language | `ccm lang`, `ccm lang en` |
+
+You can refer to an account by name, number, a name prefix, or part of its email.
+
+### Output language
+
+ccm picks its language in this order:
+
+1. The `CCM_LANG` environment variable (`en` or `ko`)
+2. The value saved with `ccm lang en` or `ccm lang ko`
+3. Korean if `LC_ALL`, `LC_MESSAGES` or `LANG` starts with `ko`
+4. Korean if the first macOS system language is Korean
+5. Otherwise English
+
+`ccm lang` shows the current language and why it was chosen. `ccm lang auto` removes the saved value.
+
+## Reading the table
+
+| On screen | Meaning |
+| --- | --- |
+| `account` / `plan` / `updated` | Account email / plan / when usage was last recorded |
+| `5-hour` / `weekly` | Usage in the 5-hour window / the weekly window |
+| `●` | The current account. The shell function starts `claude` with it |
+| `❯` and the highlighted row | The cursor |
+| Bar color | Green below 70%, yellow 70\~89%, red 90% and above |
+| `LIMIT` | That window has reached 100% |
+| `↻16:57` | When that window resets. A date is added if it is not today, e.g. `↻10/30 15:57` |
+| `reset` | The reset time has passed; shown as 0% |
+| `no data` | Claude Code hasn't been used with this account yet |
+| `Most headroom: 3 side` | The other account with the most headroom, i.e. what `ccm next` would pick. Press its number to move the cursor there |
+
+The values are what the status line received **the last time Claude Code was used with each account**. Usage on claude.ai or on other computers since then shows up the next time you use Claude Code with that account.
+
+### How ccm picks the account with the most headroom
+
+- For each account it looks at whichever window (5-hour or weekly) is closer to its limit, and picks the account where that value is lowest. Ties go to the lower 5-hour usage. Windows with no data count as 0%.
+- Accounts that are not logged in, accounts authenticated another way (such as an API key), and accounts logged in with the same email as the current one are skipped.
+- If every other account has hit a limit, ccm doesn't switch and tells you which account frees up first and when.
+
+## FAQ
+
+**The table shows `no data` everywhere.**
+Usage is recorded only after you get a reply from Claude Code with that account (`ccm run <name>`). If it still stays empty, check the status line with `ccm doctor`.
+
+**I get `ccm: command not found`, or Claude Code's status line is blank.**
+Moving or renaming the ccm folder leaves `~/.local/bin/ccm` pointing at a file that no longer exists. Claude Code doesn't show an error in that case; it just leaves the status line blank, and usage stops being recorded. Run this in the new location:
 
 ```sh
-./install.sh            # 링크를 새 위치로 다시 만듦
-./ccm doctor --fix      # 링크와 상태줄 명령 경로를 점검하고 고침
+./install.sh          # recreate the link to the new location
+./ccm doctor --fix    # check and repair the link and the status line command
 ```
 
-`ccm`과 `ccm doctor`는 상태줄 명령에 적힌 Python과 ccm 파일이 실제로 있는지 확인하고, 없으면 경고합니다.
+**I added an account but it logged in as a different one.**
+Your browser approved the account it was already logged in to. Log out in the browser or use a private window, then run `ccm login <name>`.
 
-## 계정 추가
+**ccm warns that `ANTHROPIC_API_KEY` is still set.**
+While that variable is set, Claude Code uses the API key instead of the account you logged in with. Remove it from your shell config, then open a new terminal or run `unset ANTHROPIC_API_KEY`. If you run `!ccm` inside a Claude Code session, the session's inherited value keeps triggering the warning, so check from a new terminal.
 
-```sh
-ccm add work --email me@company.com
-ccm add side
-```
+**Do I have to register my MCP servers again for each account?**
+`ccm add` copies the default account's MCP servers. If you add servers to default later, run `ccm sync`. Project-scoped servers in a repository's `.mcp.json` work in every account without copying.
 
-브라우저가 열리면 그 프로필에 쓸 계정으로 로그인합니다. 브라우저에 다른 계정이 이미 로그인되어 있으면 그 계정이 그대로 승인될 수 있습니다. 이때는 브라우저에서 로그아웃하거나, 터미널에 나온 로그인 주소를 시크릿 창에서 여세요. 로그인이 끝나면 어느 이메일로 들어갔는지 출력합니다. 이미 등록한 계정과 같으면 경고를 함께 출력합니다.
+**Does it work with Team plans?**
+Usage recording has been confirmed with a Team plan account. Enterprise accounts have not been tested.
 
-원래 쓰던 계정은 `default`로 이미 들어 있으니 따로 추가하지 않아도 됩니다.
-
-로그인이 끝나면 `default` 계정에 등록한 MCP 서버와 신뢰한 폴더 목록을 새 계정에 복사합니다(`ccm sync <이름>`과 같은 동작). 그래서 새 계정으로 처음 실행해도 이미 신뢰한 폴더에서 신뢰 확인을 다시 묻지 않습니다. 복사하지 않으려면 `--no-sync`를 붙이세요.
-
-## 사용
-
-| 하려는 일 | 명령 |
-| --- | --- |
-| 사용량 표를 보고 계정을 골라 실행 | `ccm` |
-| 고른 계정으로 이전 대화 이어서 실행 | `ccm -- -c` |
-| 표에서 고르되 계정만 바꾸기 | `ccm -n` |
-| 계정만 바꾸기 (이후 `claude`에 적용) | `ccm use work` 또는 `ccm use 2` |
-| 현재 계정은 두고 다른 계정으로 한 번만 실행 | `ccm run side -c` |
-| 여유가 가장 많은 다른 계정으로 바꾸고 이전 대화 이어서 실행 | `ccm next -c` |
-| 여유가 가장 많은 다른 계정으로 계정만 바꾸기 | `ccm next -n` |
-| 표만 보기 / JSON으로 보기 | `ccm ls`, `ccm ls --json` |
-| 다시 로그인 | `ccm login work` |
-| 계정 삭제 (로그아웃 후 폴더 삭제) | `ccm rm side` |
-| default의 MCP 서버와 신뢰한 폴더를 다른 계정에 복사 | `ccm sync`, `ccm sync --dry-run` |
-| 설정 점검, 끊긴 공유 링크·ccm 링크·상태줄 경로 다시 연결 | `ccm doctor`, `ccm doctor --fix` |
-
-계정은 이름, 번호, 이름 앞부분, 이메일 일부 중 어느 것으로도 지정할 수 있습니다.
-
-`ccm use`로 계정을 바꾸면 그 뒤에 새로 실행하는 `claude`부터 바뀐 계정을 씁니다. 이미 실행 중인 세션은 원래 계정을 계속 씁니다. 한도에 걸린 세션을 다른 계정으로 이어 가려면 세션을 종료하고 `ccm`에서 계정을 고른 뒤 `claude -c`로 다시 시작하세요. `ccm -- -c`로 고르고 바로 이어 가거나, `ccm next -c`로 고르는 단계 없이 이어 갈 수 있습니다.
-
-### 여유가 많은 계정 고르기
-
-`ccm next`는 현재 계정을 뺀 계정 가운데 여유가 가장 많은 계정으로 바꾸고 `claude`를 실행합니다. `-n` 말고 다른 인자는 `claude`에 그대로 넘깁니다(`ccm next -c`).
-
-- 5시간·주간 두 창 가운데 사용률이 높은 쪽, 곧 먼저 한도에 닿을 창의 사용률을 비교해 낮은 계정을 고릅니다. 같으면 5시간 사용률이 낮은 계정을 고릅니다. 기록이 없는 창은 0%로 봅니다.
-- 로그인되지 않은 계정, API 키처럼 다른 방식으로 인증한 계정, 현재 계정과 같은 이메일로 로그인한 계정은 후보에서 뺍니다.
-- 다른 계정이 모두 한도에 도달했으면 바꾸지 않고, 가장 먼저 풀리는 계정과 초기화 시각을 알려 줍니다.
-- 표 아래의 "여유가 가장 많은 다른 계정"도 같은 기준으로 고릅니다.
-
-## 사용량 표시에 대해
-
-- 표의 값은 **각 계정으로 Claude Code를 마지막으로 썼을 때** 상태줄이 받은 값입니다. 그 계정으로 세션을 열고 첫 응답을 받아야 값이 갱신됩니다.
-- 초기화 시각이 지난 창은 `0% 초기화됨`으로 표시합니다. 그 사이에 claude.ai 웹이나 다른 컴퓨터에서 쓴 양은 다음에 그 계정으로 Claude Code를 쓸 때 반영됩니다.
-- 한 번도 Claude Code로 쓰지 않은 계정은 `기록 없음`으로 나옵니다.
-- 같은 계정으로 세션을 여러 개 띄우면, 쉬고 있던 세션도 프롬프트 캐시가 만료되거나 창이 초기화될 때 자기가 마지막으로 받은 값으로 상태줄을 다시 그립니다. ccm은 이런 예전 값으로 기록을 바꾸지 않습니다. 초기화 시각이 같은 창이면 더 높은 사용률만 기록하고, 이미 끝난 창의 값은 버립니다. 상태줄에도 이렇게 합친 최신 값을 보여 줍니다.
-- 같은 이메일·조직으로 로그인한 프로필이 여럿이면 한도를 함께 쓰므로, 표에는 그중 가장 최근 기록을 함께 보여 줍니다.
-- Claude Code 문서에는 `rate_limits`가 Pro·Max 구독에서 제공된다고 나와 있지만, Team 요금제 계정에서도 값이 오는 것을 확인했습니다. Enterprise 계정은 확인하지 않았습니다.
-- `ANTHROPIC_API_KEY` 같은 환경변수가 설정되어 있으면 Claude Code는 로그인한 계정 대신 그 값을 씁니다. `ccm`과 `ccm doctor`가 이 경우를 경고합니다. 표의 계정 열은 이 변수와 관계없이 각 계정에 로그인한 이메일을 보여 줍니다.
-- 환경변수는 프로세스가 시작될 때 정해집니다. 셸 설정 파일에서 변수를 지워도 이미 열려 있는 터미널과 실행 중인 Claude Code 세션에는 값이 남아 있습니다. 그래서 그 안에서 `ccm`(세션 안에서는 `!ccm`)을 실행하면 경고가 계속 나옵니다. 새 터미널에서 실행해 확인하세요.
-
-## 계정을 바꿔도 이어지는 작업
-
-모든 계정의 세션이 `~/.claude` 아래 같은 폴더에 기록됩니다. 그래서 같은 프로젝트 폴더에서는 어느 계정으로 실행해도 다음 기록을 함께 씁니다.
-
-| 하려는 일 | 공유되는 기록 |
-| --- | --- |
-| 마지막 대화를 다른 계정으로 이어서 하기 (`claude -c`, `ccm -- -c`) | `projects`의 세션 기록 |
-| 이전 세션을 골라 다시 열기 (`/resume`, `claude --resume`) | 모든 계정의 세션이 한 목록에 나옵니다 |
-| 이어 간 세션의 작업 목록 보기 | `tasks`, `todos`, `plans` |
-| 새 세션에서도 프로젝트 내용 기억하기 | `projects/<프로젝트>/memory`의 자동 메모리, `CLAUDE.md` |
-| 이전에 입력한 프롬프트를 ↑로 다시 불러오기 | `history.jsonl`, `paste-cache` |
-| 파일 변경 되돌리기 (`/rewind`) | `file-history` |
-| 다른 계정으로 실행 중인 세션 찾기와 메시지 주고받기 | `sessions`, `teams` |
-
-`claude -c`가 다른 계정 폴더에서도 같은 세션에 이어 붙는 것은 실제 `claude`로 확인했습니다. 세션 기록을 공유하지 않으려면 계정을 추가할 때 `--no-share-history`를 붙이세요.
-
-## 공유하는 항목과 공유하지 않는 항목
-
-새 계정 폴더에는 아래 항목을 `~/.claude`로 링크합니다.
-
-- 설정: `settings.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `plugins`, `output-styles`, `hooks`, `memory`, `keybindings.json`, `loop.md` (`~/.claude`에 있는 것만), `rules`, `workflows`, `themes`, `agent-memory`
-- 작업 기록: `projects`, `history.jsonl`, `file-history`, `todos`, `plans`, `tasks`, `teams`, `paste-cache`, `session-env`, `sessions`
-
-작업 기록 폴더와 `rules`, `workflows`, `themes`, `agent-memory` 폴더는 `~/.claude`에 아직 없으면 먼저 만들고 링크합니다. 링크가 없는 상태에서 Claude Code가 그 폴더를 쓰면 계정 폴더 안에 따로 만들어 기록이 계정별로 나뉘기 때문입니다. 예를 들어 사용자 범위 메모리를 쓰는 서브에이전트는 `agent-memory`에 기록을 남기는데, 링크가 없으면 계정마다 메모리가 달라집니다.
-
-`ccm`, `ccm ls`, `ccm use`, `ccm run`, `ccm next`를 실행할 때마다 링크를 점검합니다. 빠진 링크는 새로 만듭니다. 계정 폴더 안에 따로 생긴 기록 폴더가 있으면 내용을 `~/.claude` 쪽으로 옮긴 뒤 링크로 바꿉니다. 이름이 겹치는 폴더는 안쪽 내용을 합칩니다. 이름이 겹치는 파일은 `note.json.work`처럼 계정 이름을 붙여 옮기고, 어떤 파일도 지우지 않습니다(`.DS_Store` 제외). 옮긴 내용은 실행할 때 한 줄로 알려 줍니다.
-
-계정마다 따로 두는 것은 아래와 같습니다.
-
-- **로그인 정보**: 계정을 나누는 목적이므로 공유하지 않습니다.
-- **`.claude.json`**: 사용자 범위·로컬 범위 MCP 서버 목록, 폴더 신뢰 여부, 첫 실행 설정이 들어 있습니다. 로그인한 계정 정보도 같은 파일에 있어서 링크로 공유할 수 없습니다. 대신 `ccm sync`가 MCP 서버와 폴더 신뢰 여부를 복사합니다(아래 참고). 첫 실행 때 나오는 테마 선택은 계정마다 한 번씩 다시 나올 수 있습니다. 저장소의 `.mcp.json`에 넣은 프로젝트 범위 MCP 서버는 모든 계정에서 그대로 쓰입니다.
-- **`jobs`, `daemon`**: 계정마다 따로 실행되는 백그라운드 작업입니다. 공유하면 같은 작업이 두 번 실행될 수 있어서 나눠 둡니다.
-
-Claude Code가 설정 파일을 저장하면서 링크를 일반 파일로 바꾸면 그 항목은 더 이상 공유되지 않습니다. `ccm doctor`가 이런 항목을 찾아 알려 줍니다.
-
-### MCP 서버와 폴더 신뢰 설정 복사
-
-`ccm sync`는 한 계정의 `.claude.json`에서 아래 설정을 읽어 다른 계정의 `.claude.json`에 합칩니다. default 계정의 파일은 `~/.claude.json`, 추가한 계정의 파일은 `~/.ccm/profiles/<이름>/.claude.json`입니다.
-
-- 사용자 범위 MCP 서버 (`claude mcp add -s user`로 등록한 서버)
-- 프로젝트별 로컬 범위 MCP 서버 (`claude mcp add`로 그 폴더에서 등록한 서버)
-- 폴더 신뢰 여부 (신뢰 확인 창에서 허용한 폴더)
-
-| 하려는 일 | 명령 |
-| --- | --- |
-| default의 설정을 나머지 모든 계정에 복사 | `ccm sync` |
-| 특정 계정에만 복사 | `ccm sync work side` |
-| 다른 계정의 설정을 가져와 복사 | `ccm sync --from work` |
-| 바꿀 내용만 미리 보기 | `ccm sync --dry-run` |
-| 이름이 같고 설정이 다른 MCP 서버도 덮어쓰기 | `ccm sync --replace` |
-
-받는 계정에 없는 항목만 추가하고, 지우는 항목은 없습니다. 이름이 같은데 설정이 다른 MCP 서버는 그대로 두고 이름을 알려 줍니다. Claude Code가 이 파일을 고칠 때 쓰는 잠금(`.claude.json.lock` 폴더)을 똑같이 잡고 고치므로, 그 계정으로 실행 중인 세션이 있어도 서로의 변경을 덮어쓰지 않습니다. 다만 실행 중인 세션에는 다시 시작해야 반영됩니다.
-
-## 파일 위치
-
-| 경로 | 내용 |
-| --- | --- |
-| `~/.ccm/config.json` | 계정 목록, 현재 계정, 마지막으로 확인한 이메일·요금제 |
-| `~/.ccm/current-dir` | 셸 함수가 읽는 현재 계정 폴더 경로 (default면 빈 파일) |
-| `~/.ccm/profiles/<이름>/` | 추가한 계정의 Claude Code 설정 폴더 |
-| `~/.ccm/usage/<이름>.json` | 상태줄이 기록한 계정별 사용률 |
-| `~/.ccm/statusline-prev.json` | `ccm setup` 전에 쓰던 상태줄 설정 (`--undo`가 복원) |
-
-## 완전히 지우기
+**How do I uninstall ccm?**
 
 ```sh
-ccm rm <이름>          # 추가한 계정마다 실행 (키체인의 로그인 정보도 삭제)
-ccm setup --undo
+ccm rm <name>          # for each account you added (also removes its login from the keychain)
+ccm setup --undo       # restore the status line setting and remove the shell function
 rm ~/.local/bin/ccm
 rm -rf ~/.ccm
 ```
 
-## 테스트
+## How it works
+
+- **A separate config folder per account.** ccm uses the multi-account approach from the Claude Code docs (`CLAUDE_CONFIG_DIR`). Your existing `~/.claude` is the `default` account; each added account uses `~/.ccm/profiles/<name>/`.
+- **Claude Code handles login.** `ccm add` runs `claude auth login` with that folder. Claude Code stores the login in the keychain per folder.
+- **The status line records usage.** Claude Code passes `rate_limits` (5-hour and weekly usage and reset times) to the status line command. ccm saves them to `~/.ccm/usage/<name>.json`.
+- **Settings and history are shared.** Each added account's folder contains symlinks to the settings, skills, plugins, session history and task lists in `~/.claude`. That is why you can switch accounts in the same project and continue where you left off.
+
+<details>
+<summary><b>What carries over when you switch accounts</b></summary>
+
+Sessions from every account are recorded under the same folders in `~/.claude`, so within the same project folder every account shares the following.
+
+| To do this | Shared data |
+| --- | --- |
+| Continue the last conversation with another account (`claude -c`, `ccm next -c`) | Session history in `projects` |
+| Reopen an earlier session (`/resume`, `claude --resume`) | Sessions from all accounts appear in one list |
+| See the task list of a continued session | `tasks`, `todos`, `plans` |
+| Remember the project in new sessions | Auto memory in `projects/<project>/memory`, `CLAUDE.md` |
+| Recall earlier prompts with ↑ | `history.jsonl`, `paste-cache` |
+| Undo file changes (`/rewind`) | `file-history` |
+| Find and message sessions running under another account | `sessions`, `teams` |
+
+Continuing the same session with `claude -c` from another account's folder has been verified with the real `claude`. To keep session history separate, add `--no-share-history` when adding the account.
+
+</details>
+
+<details>
+<summary><b>What is shared and what is not</b></summary>
+
+A new account folder gets these links to `~/.claude`:
+
+- Settings: `settings.json`, `CLAUDE.md`, `agents`, `commands`, `skills`, `plugins`, `output-styles`, `hooks`, `memory`, `keybindings.json`, `loop.md` (only those that exist in `~/.claude`), `rules`, `workflows`, `themes`, `agent-memory`
+- History: `projects`, `history.jsonl`, `file-history`, `todos`, `plans`, `tasks`, `teams`, `paste-cache`, `session-env`, `sessions`
+
+The history folders and `rules`, `workflows`, `themes` and `agent-memory` are created in `~/.claude` first if they don't exist. Without the link, Claude Code would create the folder inside the account folder and the data would split by account. For example, subagents with user-scope memory write to `agent-memory`; without the link each account would have its own memory.
+
+Every run of `ccm`, `ccm ls`, `ccm use`, `ccm run` and `ccm next` checks the links. Missing links are created. If a history folder has been created inside an account folder, its contents are moved to `~/.claude` and the folder is replaced with a link. Folders with the same name are merged; files with the same name are moved with the account name appended (e.g. `note.json.work`), and nothing is deleted (except `.DS_Store`). What was moved is reported in one line.
+
+Kept separate per account:
+
+- **Login**: the whole point of separate accounts.
+- **`.claude.json`**: user- and local-scope MCP servers, folder trust and first-run settings. It also holds the logged-in account, so it can't be shared by a link. `ccm sync` copies the MCP servers and folder trust instead.
+- **`jobs`, `daemon`**: background jobs that run per account. Sharing them could run the same job twice.
+
+If Claude Code replaces a link with a regular file when saving settings, that item is no longer shared. `ccm doctor` finds such items.
+
+</details>
+
+<details>
+<summary><b>Copying MCP servers and folder trust (<code>ccm sync</code>)</b></summary>
+
+`ccm sync` reads these settings from one account's `.claude.json` and merges them into other accounts' `.claude.json`. The default account's file is `~/.claude.json`; added accounts use `~/.ccm/profiles/<name>/.claude.json`.
+
+- User-scope MCP servers (added with `claude mcp add -s user`)
+- Local-scope MCP servers per project (added with `claude mcp add` in that folder)
+- Folder trust (folders you allowed in the trust prompt)
+
+| To do this | Run |
+| --- | --- |
+| Copy default's settings to all other accounts | `ccm sync` |
+| Copy to specific accounts only | `ccm sync work side` |
+| Copy from another account | `ccm sync --from work` |
+| Preview the changes | `ccm sync --dry-run` |
+| Also overwrite MCP servers with the same name but different settings | `ccm sync --replace` |
+
+Only missing entries are added; nothing is removed. MCP servers with the same name but different settings are left alone and listed. ccm takes the same lock Claude Code uses for this file (the `.claude.json.lock` folder), so it doesn't overwrite changes from sessions running under that account. Running sessions pick up the changes after a restart.
+
+</details>
+
+<details>
+<summary><b>Details of usage recording</b></summary>
+
+- With several sessions on the same account, idle sessions also redraw their status line when the prompt cache expires or a window resets, using the last values they received. ccm ignores those older values: within the same reset time it keeps only higher usage, and values from windows that have already ended are dropped.
+- Profiles logged in with the same email and organization share their limits, so the table shows the most recent record among them.
+- Environment variables are fixed when a process starts. Removing one from your shell config doesn't affect terminals or Claude Code sessions that are already open.
+- `ccm` and `ccm doctor` check that the Python and ccm file named in the status line command actually exist, and warn if not.
+
+</details>
+
+## Files
+
+| Path | Contents |
+| --- | --- |
+| `~/.ccm/config.json` | Accounts, current account, last checked email and plan |
+| `~/.ccm/current-dir` | Current account folder read by the shell function (empty for default) |
+| `~/.ccm/profiles/<name>/` | Claude Code config folder of an added account |
+| `~/.ccm/usage/<name>.json` | Usage recorded by the status line, per account |
+| `~/.ccm/statusline-prev.json` | Your status line setting before `ccm setup` (restored by `--undo`) |
+
+## Tests
 
 ```sh
 python3 -m unittest tests.test_ccm -v
 ```
 
-테스트는 가짜 `claude`(`tests/fake_claude.py`)와 `_workspace/tmp/` 아래 임시 폴더만 쓰고, 실제 키체인과 `~/.claude`는 건드리지 않습니다.
+The tests use a fake `claude` (`tests/fake_claude.py`) and temporary folders under `_workspace/tmp/`; they never touch your real keychain or `~/.claude`.

@@ -16,9 +16,13 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import unittest
 from pathlib import Path
+
+# 테스트가 ccm을 불러올 때 프로젝트 폴더에 __pycache__를 남기지 않게 한다
+sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parent.parent
 CCM = ROOT / "ccm"
@@ -117,6 +121,8 @@ class CcmTest(unittest.TestCase):
         fake.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
         fake.chmod(0o755)
         self.log = self.root / "claude.log"
+        self.local_bin = self.root / "local-bin"
+        self.local_bin.mkdir()
         drop = {"CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
                 "CLAUDE_CODE_OAUTH_TOKEN", "CCM_SHELL_HOOK", "CLAUDECODE"}
         self.env = {k: v for k, v in os.environ.items() if k not in drop}
@@ -124,13 +130,14 @@ class CcmTest(unittest.TestCase):
             CCM_HOME=str(self.root / "ccm"),
             CCM_CLAUDE_HOME=str(self.claude_home),
             CCM_CLAUDE_BIN=str(fake),
+            CCM_BIN_DIR=str(self.local_bin),
             HOME=str(self.home),
             SHELL="/bin/zsh",
             FAKE_CLAUDE_LOG=str(self.log),
             FAKE_DEFAULT_DIR=str(self.claude_home),
             NO_COLOR="1",
             COLUMNS="140",
-            PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            PATH=os.pathsep.join([str(self.local_bin), str(self.bin), os.environ.get("PATH", "")]),
         )
 
     def tearDown(self):
@@ -161,6 +168,17 @@ class CcmTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"windows": windows, "updated_at": updated_at or time.time()}))
 
+    def write_claude_json(self, path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    def write_default_claude_json(self):
+        self.write_claude_json(self.home / ".claude.json", {
+            "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+            "projects": {"/p1": {"hasTrustDialogAccepted": True, "mcpServers": {"l": {"command": "l"}}},
+                         "/p2": {"hasTrustDialogAccepted": False}},
+        })
+
     # ---------- 프로필 추가 ----------
 
     def test_add_links_shared_items_and_logs_in(self):
@@ -181,6 +199,31 @@ class CcmTest(unittest.TestCase):
         for item in ("tasks", "teams", "sessions", "paste-cache", "session-env", "todos", "plans"):
             self.assertTrue((self.claude_home / item).is_dir(), item)
             self.assertTrue((self.pdir("work") / item).is_symlink(), item)
+
+    def test_add_shares_user_config_dirs_and_loop_file(self):
+        (self.claude_home / "loop.md").write_text("loop\n")
+        self.ccm("add", "solo", "--no-share-history")
+        d = self.pdir("solo")
+        for item in ("rules", "workflows", "themes", "agent-memory", "loop.md"):
+            self.assertTrue((d / item).is_symlink(), item)
+            self.assertEqual((d / item).resolve(), (self.claude_home / item).resolve())
+        self.assertTrue((self.claude_home / "agent-memory").is_dir())
+
+    def test_add_copies_mcp_servers_and_trust_from_default(self):
+        self.write_default_claude_json()
+        r = self.ccm("add", "work")
+        self.assertIn("default 계정에서 가져온 설정: MCP 서버 2개 추가(a, b) · 신뢰한 폴더 1개", r.stdout)
+        data = json.loads((self.pdir("work") / ".claude.json").read_text())
+        self.assertEqual(data["oauthAccount"]["emailAddress"], "user@example.com")
+        self.assertEqual(set(data["mcpServers"]), {"a", "b"})
+        p1 = data["projects"]["/p1"]
+        self.assertTrue(p1["hasTrustDialogAccepted"])
+        self.assertEqual(p1["allowedTools"], [])  # Claude Code가 읽는 기본 키를 채워 둔다
+        self.assertEqual(p1["mcpServers"], {"l": {"command": "l"}})
+        self.assertNotIn("/p2", data["projects"])
+
+        self.ccm("add", "solo", "--no-sync")
+        self.assertNotIn("mcpServers", json.loads((self.pdir("solo") / ".claude.json").read_text()))
 
     def test_split_state_is_moved_back_and_linked(self):
         self.ccm("add", "work")
@@ -278,10 +321,46 @@ class CcmTest(unittest.TestCase):
         self.assertIn("Claude Code 세션 안에서 실행해서", out)
         self.assertNotIn("unset", out)
 
+    def test_unreadable_config_is_left_untouched(self):
+        self.ccm("add", "work")
+        path = self.root / "ccm" / "config.json"
+        path.write_text('{"profiles": {"work": ')
+        self.assertIn("읽지 못했습니다", self.ccm("ls", code=1).stderr)
+        self.assertIn("읽지 못했습니다", self.ccm("use", "default", code=1).stderr)
+        self.assertEqual(path.read_text(), '{"profiles": {"work": ')
+        # 상태줄은 설정 파일이 깨져도 계속 출력한다
+        self.assertEqual(self.ccm("statusline", input="{}").stdout, "[default]")
+
     def test_ls_warns_when_statusline_is_not_connected(self):
         self.assertIn("ccm setup", self.ccm("ls").stdout)
         self.ccm("setup", "--no-shell")
         self.assertNotIn("상태줄이 연결되어 있지 않아", self.ccm("ls").stdout)
+
+    def test_broken_statusline_command_is_reported_and_fixed(self):
+        self.ccm("setup", "--no-shell")
+        moved = self.root / "old-place" / "ccm"
+        settings = json.loads(self.settings.read_text())
+        settings["statusLine"]["command"] = f"{sys.executable} {moved} statusline"
+        self.settings.write_text(json.dumps(settings))
+        self.assertIn("`./ccm doctor --fix`", self.ccm("ls").stdout)
+        self.assertIn(f"{moved} 파일이 없어", self.ccm("doctor", code=1).stdout)
+        self.ccm("doctor", "--fix", code=None)
+        self.assertNotIn(str(moved), json.loads(self.settings.read_text())["statusLine"]["command"])
+        self.assertNotIn("사용량이 기록되지 않습니다", self.ccm("ls").stdout)
+
+        settings = json.loads(self.settings.read_text())
+        settings["statusLine"]["command"] = f"/nonexistent/python3 {CCM} statusline"
+        self.settings.write_text(json.dumps(settings))
+        self.assertIn("Python(/nonexistent/python3)이 없어", self.ccm("ls").stdout)
+
+    def test_doctor_relinks_install_link_after_folder_move(self):
+        link = self.local_bin / "ccm"
+        link.symlink_to(self.root / "old-place" / "ccm")
+        self.assertIn(f"{link} 링크가 가리키는", self.ccm("doctor", code=1).stdout)
+        out = self.ccm("doctor", "--fix", code=None).stdout
+        self.assertIn("ccm 링크를 다시 만들었습니다", out)
+        self.assertIn(f"✓ ccm 명령: {link}", out)
+        self.assertEqual(link.resolve(), CCM.resolve())
 
     # ---------- 상태줄 ----------
 
@@ -311,6 +390,32 @@ class CcmTest(unittest.TestCase):
         # rate_limits가 없는 호출(세션 첫 응답 전)은 마지막 기록을 보여 주고 기록은 바꾸지 않는다
         r = subprocess.run(command, shell=True, input="{}", env=env, capture_output=True, text=True)
         self.assertIn("[work] 5h 72%", r.stdout)
+
+    def test_statusline_ignores_older_values_from_idle_sessions(self):
+        self.ccm("add", "work")
+        env = {**self.env, "CLAUDE_CONFIG_DIR": str(self.pdir("work"))}
+        usage = self.root / "ccm" / "usage" / "work.json"
+        reset = time.time() + 3600
+
+        def send(pct, resets_at):
+            payload = {"rate_limits": {"five_hour": {"used_percentage": pct, "resets_at": resets_at}}}
+            return self.ccm("statusline", env=env, input=json.dumps(payload)).stdout
+
+        def saved():
+            rec = json.loads(usage.read_text())
+            return rec["windows"]["five_hour"]["used_percentage"], rec["updated_at"]
+
+        send(60, reset)
+        first = saved()
+        # 쉬고 있던 세션이 같은 창의 예전 값으로 상태줄을 다시 그려도 기록과 표시는 최신 값을 유지한다
+        self.assertIn("5h 60%", send(30, reset))
+        self.assertEqual(saved(), first)
+        # 이미 끝난 창의 값도 기록하지 않는다
+        send(90, reset - 5 * 3600)
+        self.assertEqual(saved(), first)
+        # 새 창이 시작되면 더 낮은 값이라도 기록한다
+        self.assertIn("5h 5%", send(5, reset + 5 * 3600))
+        self.assertEqual(saved()[0], 5)
 
     def test_statusline_for_default_and_unknown_dirs(self):
         payload = json.dumps({"rate_limits": {"five_hour": {"used_percentage": 10, "resets_at": time.time() + 60}}})
@@ -365,6 +470,58 @@ class CcmTest(unittest.TestCase):
         self.ccm("run", "work", "-c", "--model", "sonnet")
         self.assertEqual(self.calls()[-1], {"args": ["-c", "--model", "sonnet"], "config_dir": str(self.pdir("work"))})
         self.assertEqual(self.config()["current"], "default")
+
+    def test_next_switches_to_account_with_most_headroom(self):
+        for name in ("work", "side", "spare"):
+            self.ccm("add", name, "--email", f"{name}@example.com")
+        self.ccm("use", "work")
+        now = time.time()
+        self.write_usage("work", {"five_hour": {"used_percentage": 100.0, "resets_at": now + 600}})
+        self.write_usage("side", {"five_hour": {"used_percentage": 20.0, "resets_at": now + 600},
+                                  "seven_day": {"used_percentage": 85.0, "resets_at": now + 86400}})
+        self.write_usage("spare", {"five_hour": {"used_percentage": 40.0, "resets_at": now + 600},
+                                   "seven_day": {"used_percentage": 10.0, "resets_at": now + 86400}})
+        out = self.ccm("ls").stdout
+        self.assertIn("한도", next(line for line in out.splitlines() if "2  work" in line))
+        self.assertIn("여유가 가장 많은 다른 계정: 4 spare (5시간 40% · 주간 10%) · `ccm next`로 전환", out)
+
+        # 주간 사용률이 높은 side보다 두 창 모두 여유가 있는 spare를 고른다
+        r = self.ccm("next", "-c")
+        self.assertIn("현재 계정을 spare(으)로 바꿨습니다: 5시간 40% · 주간 10%", r.stdout)
+        self.assertEqual(self.calls()[-1], {"args": ["-c"], "config_dir": str(self.pdir("spare"))})
+        self.assertEqual(self.config()["current"], "spare")
+
+        # 다음 후보는 현재 계정을 뺀 나머지에서 고른다
+        before = len(self.calls())
+        self.ccm("next", "-n")
+        self.assertEqual(self.config()["current"], "side")
+        self.assertFalse([c for c in self.calls()[before:] if c["args"][:1] != ["auth"]])
+
+    def test_next_reports_when_every_other_account_is_limited(self):
+        self.ccm("add", "work", "--email", "w@example.com")
+        self.ccm("add", "side", "--email", "s@example.com")
+        self.ccm("use", "work")
+        self.write_usage("side", {"seven_day": {"used_percentage": 100.0, "resets_at": time.time() + 7200}})
+        r = self.ccm("next", "-n", code=1)
+        self.assertIn("다른 계정도 모두 한도에 도달했습니다. 가장 먼저 풀리는 계정은 side(↻", r.stderr)
+        self.assertEqual(self.config()["current"], "work")
+
+    def test_profiles_of_same_account_share_latest_usage(self):
+        self.ccm("add", "a", "--email", "same@example.com")
+        self.ccm("add", "b", "--email", "same@example.com")
+        self.ccm("add", "c", "--email", "other@example.com")
+        now = time.time()
+        week = {"resets_at": now + 86400}
+        self.write_usage("a", {"seven_day": {**week, "used_percentage": 5.0}}, updated_at=now - 3 * 86400)
+        self.write_usage("b", {"seven_day": {**week, "used_percentage": 70.0}}, updated_at=now - 60)
+        self.write_usage("c", {"seven_day": {**week, "used_percentage": 80.0}})
+        # 같은 계정이면 한도를 함께 쓰므로 오래된 a의 기록 대신 b의 최근 기록을 보여 준다
+        data = {p["name"]: p for p in json.loads(self.ccm("ls", "--json").stdout)}
+        self.assertEqual(data["a"]["seven_day"]["used_percentage"], 70.0)
+        # a에서 바꿀 때 같은 계정인 b는 후보에서 빠진다
+        self.ccm("use", "a")
+        self.ccm("next", "-n")
+        self.assertEqual(self.config()["current"], "c")
 
     def test_pick_moves_with_arrow_keys_and_launches(self):
         self.ccm("add", "work", "--email", "w@example.com")
@@ -502,6 +659,50 @@ class CcmTest(unittest.TestCase):
         self.ccm("doctor", "--fix", code=1)
         self.assertTrue((d / "CLAUDE.md").is_symlink())
 
+
+    # ---------- 설정 복사 ----------
+
+    def test_sync_keeps_different_servers_unless_replace(self):
+        self.ccm("add", "work")
+        target = self.pdir("work") / ".claude.json"
+        self.write_claude_json(target, {"mcpServers": {"b": {"command": "mine"}}, "other": 1,
+                                        "projects": {"/p1": {"allowedTools": ["x"], "hasTrustDialogAccepted": False}}})
+        self.write_default_claude_json()
+
+        out = self.ccm("sync", "--dry-run").stdout
+        self.assertIn("[work] MCP 서버 1개 추가(a) · 신뢰한 폴더 1개 · 프로젝트별 MCP 서버 1개", out)
+        self.assertIn("파일은 바꾸지 않았습니다", out)
+        self.assertEqual(json.loads(target.read_text())["mcpServers"], {"b": {"command": "mine"}})
+
+        self.assertIn("그대로 둔 MCP 서버: b", self.ccm("sync").stdout)
+        data = json.loads(target.read_text())
+        self.assertEqual(data["mcpServers"], {"a": {"command": "a"}, "b": {"command": "mine"}})
+        self.assertEqual(data["projects"]["/p1"]["allowedTools"], ["x"])  # 이미 있는 프로젝트 설정은 유지한다
+        self.assertTrue(data["projects"]["/p1"]["hasTrustDialogAccepted"])
+        self.assertEqual(data["other"], 1)
+        self.assertIn("[work] 바꿀 것 없음", self.ccm("sync").stdout)
+
+        self.assertIn("MCP 서버 1개 덮어씀(b)", self.ccm("sync", "work", "--replace").stdout)
+        self.assertEqual(json.loads(target.read_text())["mcpServers"]["b"], {"command": "b"})
+        self.assertIn("'nope' 계정을 찾지 못했습니다", self.ccm("sync", "--from", "nope", code=1).stderr)
+
+    def test_sync_waits_for_claude_code_lock(self):
+        self.ccm("add", "work")
+        self.write_default_claude_json()
+        lock = self.pdir("work") / ".claude.json.lock"
+        # 끝난 프로그램이 남긴 오래된 잠금은 지우고 진행한다
+        lock.mkdir()
+        os.utime(lock, (time.time() - 60, time.time() - 60))
+        self.ccm("sync")
+        self.assertFalse(lock.exists())
+        # 다른 프로그램이 잡고 있는 잠금은 풀릴 때까지 기다린다
+        (self.pdir("work") / ".claude.json").write_text("{}")
+        lock.mkdir()
+        threading.Timer(1.0, lock.rmdir).start()
+        started = time.time()
+        self.ccm("sync")
+        self.assertGreaterEqual(time.time() - started, 0.9)
+        self.assertIn("a", json.loads((self.pdir("work") / ".claude.json").read_text())["mcpServers"])
 
 class HelperTest(unittest.TestCase):
     @classmethod

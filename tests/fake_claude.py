@@ -34,6 +34,10 @@ if args[:2] == ["auth", "login"]:
     email = args[args.index("--email") + 1] if "--email" in args else os.environ.get("FAKE_LOGIN_EMAIL", "user@example.com")
     Path(config_dir).mkdir(parents=True, exist_ok=True)
     state.write_text(json.dumps({"email": email, "orgName": "Org", "subscriptionType": "max"}))
+    # 실제 claude처럼 로그인하면 계정 정보를 담은 .claude.json이 생긴다
+    config = Path(config_dir) / ".claude.json"
+    if not config.exists():
+        config.write_text(json.dumps({"oauthAccount": {"emailAddress": email}, "projects": {}}))
     sys.exit(0)
 
 if args[:2] == ["auth", "logout"]:

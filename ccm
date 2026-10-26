@@ -8,7 +8,9 @@
 """
 
 import argparse
+import base64
 import copy
+import hashlib
 import json
 import os
 import plistlib
@@ -16,17 +18,27 @@ import re
 import select
 import shlex
 import shutil
+import stat
+import struct
 import subprocess
 import sys
-import termios
 import time
-import tty
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.3.0"
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+else:
+    import termios
+    import tty
+
+VERSION = "0.4.0"
 DEFAULT = "default"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,23}$")
 
@@ -152,7 +164,7 @@ def script_path():
     """설정 파일에 적을 ccm 경로. PATH의 ccm 링크가 이 파일을 가리키면 링크 경로를 쓴다."""
     here = Path(__file__).resolve()
     found = shutil.which("ccm")
-    if found and Path(found).resolve() == here:
+    if not WINDOWS and found and Path(found).resolve() == here:
         return Path(found).absolute()
     return here
 
@@ -191,15 +203,17 @@ def override_notice():
     if not found:
         return None
     names = ", ".join(found)
+    unset = ("; ".join(f"Remove-Item Env:{v}" for v in found) if WINDOWS
+             else f"unset {' '.join(found)}")
     if os.environ.get("CLAUDECODE"):
         return tr(f"{names}: Claude Code 세션 안에서 실행해서 그 세션의 환경변수를 물려받았습니다. "
                   "터미널에서 직접 `ccm`을 실행했을 때 이 안내가 나오지 않으면 문제없습니다.",
                   f"{names}: inherited from the Claude Code session this was run in. "
                   "If running `ccm` directly in a terminal doesn't show this, there is nothing to fix.")
     return tr(f"{names} 환경변수가 이 셸에 남아 있어, 여기서 실행하는 claude는 로그인 계정 대신 그 값을 씁니다. "
-              f"설정 파일에서 지웠다면 새 터미널을 열거나 `unset {' '.join(found)}`를 실행하세요.",
+              f"설정 파일에서 지웠다면 새 터미널을 열거나 `{unset}`를 실행하세요.",
               f"{names} is set in this shell, so claude started here uses it instead of the logged-in account. "
-              f"If you removed it from your shell config, open a new terminal or run `unset {' '.join(found)}`.")
+              f"If you removed it from your shell config, open a new terminal or run `{unset}`.")
 
 
 def usage_path(name):
@@ -211,9 +225,57 @@ def settings_path():
 
 
 def rc_file():
+    if WINDOWS:
+        explicit = os.environ.get("CCM_POWERSHELL_PROFILE")
+        if explicit:
+            return Path(explicit).expanduser()
+        try:
+            result = subprocess.run(
+                [powershell_bin(), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                 "[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); $PROFILE.CurrentUserAllHosts"],
+                capture_output=True, encoding="utf-8", timeout=10, check=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise CcmError(tr("PowerShell 프로필을 찾지 못했습니다. CCM_POWERSHELL_PROFILE에 경로를 지정하세요.",
+                              "Could not find the PowerShell profile. Set CCM_POWERSHELL_PROFILE to its path.")) from e
+        if not result.stdout.strip():
+            raise CcmError("PowerShell profile path is empty")
+        return Path(result.stdout.strip())
     if os.path.basename(os.environ.get("SHELL", "")) == "bash":
         return Path.home() / (".bash_profile" if sys.platform == "darwin" else ".bashrc")
     return Path.home() / ".zshrc"
+
+
+def powershell_bin():
+    return os.environ.get("CCM_POWERSHELL") or shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+
+
+def ps_quote(text):
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def claude_command(*args):
+    """테스트용 Python 스크립트도 같은 프로세스 실행 경로로 다룬다."""
+    exe = claude_bin()
+    return [sys.executable, exe, *args] if exe.lower().endswith(".py") else [exe, *args]
+
+
+def read_rc(path):
+    data = path.read_bytes() if path.exists() else b""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = data.decode("utf-16")
+    else:
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            if not WINDOWS:
+                raise
+            text = data.decode("mbcs")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def write_rc(path, text):
+    # Windows PowerShell 5.1도 한글을 UTF-8로 읽도록 BOM을 붙인다.
+    write_text(path, ("\ufeff" if WINDOWS else "") + text, 0o644)
 
 
 # ---------- 파일 ----------
@@ -320,8 +382,8 @@ def auth_status(name, timeout=30):
     if d is not None and not d.is_dir():
         return {"error": tr("프로필 폴더 없음", "profile folder missing")}
     try:
-        r = subprocess.run([claude_bin(), "auth", "status", "--json"], env=auth_env(name),
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        r = subprocess.run(claude_command("auth", "status", "--json"), env=auth_env(name),
+                           stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", errors="replace",
                            timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"error": str(e)}
@@ -660,8 +722,60 @@ def print_table(cfg):
 
 # ---------- 방향키 선택 화면 ----------
 
+def windows_api():
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "GetStdHandle": ([wintypes.DWORD], wintypes.HANDLE),
+        "GetConsoleMode": ([wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        "SetConsoleMode": ([wintypes.HANDLE, wintypes.DWORD], wintypes.BOOL),
+        "CreateFileW": ([wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE], wintypes.HANDLE),
+        "DeviceIoControl": ([wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                             ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                             ctypes.c_void_p], wintypes.BOOL),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+    }
+    for name, (args, result) in signatures.items():
+        fn = getattr(api, name)
+        fn.argtypes, fn.restype = args, result
+    return api
+
+
+@contextmanager
+def terminal_mode(fd):
+    if WINDOWS:
+        api = windows_api()
+        handle, mode = api.GetStdHandle(-11), wintypes.DWORD()
+        changed = api.GetConsoleMode(handle, ctypes.byref(mode))
+        if changed:
+            api.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        try:
+            yield
+        finally:
+            if changed:
+                api.SetConsoleMode(handle, mode.value)
+    else:
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            yield
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def read_key(fd):
     """키 하나를 읽어 'up', 'down', 'enter', 'esc' 또는 입력한 문자로 돌려준다."""
+    if WINDOWS:
+        while not msvcrt.kbhit():
+            time.sleep(0.02)  # Ctrl+C 신호를 처리하면서 키 입력을 기다린다.
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            return {"H": "up", "P": "down"}.get(msvcrt.getwch(), "")
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch == "\x1a":
+            raise EOFError
+        return {"\x1b": "esc", "\r": "enter", "\n": "enter"}.get(ch, ch)
     ch = os.read(fd, 1)
     if not ch:
         raise EOFError
@@ -684,6 +798,11 @@ def read_key(fd):
 
 
 def pick_interactive(cfg, no_launch):
+    with terminal_mode(sys.stdin.fileno()):
+        return _pick_interactive(cfg, no_launch)
+
+
+def _pick_interactive(cfg, no_launch):
     """방향키로 계정을 고르게 한다. 고른 이름을 돌려주고(cfg의 현재 계정도 바꾼다), 종료하면 None을 돌려준다."""
     names = list(cfg["profiles"])
     selected = names.index(cfg["current"])
@@ -704,9 +823,7 @@ def pick_interactive(cfg, no_launch):
         out.flush()
         drawn = sum(max(1, -(-dwidth(line) // width)) for line in lines)
 
-    old = termios.tcgetattr(fd)
     try:
-        tty.setcbreak(fd)
         out.write("\x1b[?25l")  # 다시 그리는 동안 커서를 숨긴다
         draw(help_line)
         confirming = False
@@ -746,13 +863,67 @@ def pick_interactive(cfg, no_launch):
     finally:
         out.write("\x1b[?25h\n")
         out.flush()
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 # ---------- 프로필 폴더 ----------
 
 def shared_items(share_history):
     return SHARED_CONFIG + (SHARED_HISTORY if share_history else [])
+
+
+def is_junction(path):
+    try:
+        return WINDOWS and path.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    except OSError:
+        return False
+
+
+def make_junction(src, dst):
+    """관리자 권한 없이 폴더 junction을 만든다. 대상 폴더 내용은 수정하지 않는다."""
+    target = str(src.resolve())
+    substitute = ("\\??\\UNC\\" + target[2:] if target.startswith("\\\\") else "\\??\\" + target).encode("utf-16-le")
+    printed = target.encode("utf-16-le")
+    names = substitute + b"\x00\x00" + printed + b"\x00\x00"
+    data = struct.pack("<IHHHHHH", 0xA0000003, 8 + len(names), 0,
+                       0, len(substitute), len(substitute) + 2, len(printed)) + names
+    api = windows_api()
+    dst.mkdir()
+    handle = api.CreateFileW(str(dst), 0x40000000, 7, None, 3, 0x02200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.WinError(ctypes.get_last_error())
+        dst.rmdir()
+        raise error
+    try:
+        returned = wintypes.DWORD()
+        if not api.DeviceIoControl(handle, 0x000900A4, data, len(data), None, 0,
+                                   ctypes.byref(returned), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except OSError:
+        api.CloseHandle(handle)
+        handle = None
+        dst.rmdir()
+        raise
+    finally:
+        if handle is not None:
+            api.CloseHandle(handle)
+
+
+def make_shared_link(src, dst):
+    try:
+        dst.symlink_to(src, target_is_directory=src.is_dir())
+        return "symlink"
+    except OSError as e:
+        if not WINDOWS or getattr(e, "winerror", None) not in (5, 50, 1314):
+            raise
+    if src.is_dir():
+        make_junction(src, dst)
+        return "junction"
+    os.link(src, dst)
+    return "hardlink"
+
+
+def file_digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def merge_dir(src, dst, tag):
@@ -768,7 +939,8 @@ def merge_dir(src, dst, tag):
             continue
         target = src / entry.name
         if target.exists() or target.is_symlink():
-            if entry.is_dir() and not entry.is_symlink() and target.is_dir() and not target.is_symlink():
+            if (entry.is_dir() and not entry.is_symlink() and not is_junction(entry)
+                    and target.is_dir() and not target.is_symlink() and not is_junction(target)):
                 moved += merge_dir(target, entry, tag)
                 entry.rmdir()
                 continue
@@ -785,25 +957,40 @@ def repair_links(pdir, share_history, tag):
     """프로필 폴더의 공유 링크를 맞춘다. 없는 링크는 만들고, 계정 폴더에 따로 생긴 기록 폴더는
     내용을 ~/.claude로 옮긴 뒤 링크로 바꾼다. (항목, 옮긴 개수, 오류) 목록을 돌려준다."""
     done = []
+    manifest_path = pdir / ".ccm-hardlinks.json"
+    managed = read_json(manifest_path, {}) if WINDOWS else {}
+    managed = managed if isinstance(managed, dict) else {}
+    before = dict(managed)
     for item in shared_items(share_history):
         src, dst = claude_home() / item, pdir / item
-        if dst.is_symlink():
+        if dst.is_symlink() or is_junction(dst):
             continue
         try:
             if item in STATE_DIRS:
                 src.mkdir(parents=True, exist_ok=True)
             if not src.exists():
                 continue
+            if WINDOWS and src.is_file() and dst.is_file():
+                if dst.samefile(src):
+                    managed[item] = file_digest(dst)
+                    continue
+                # 원본의 원자적 저장으로 끊어진 hard link만 복구한다. 별도로 고친 파일은 보존한다.
+                if item in managed and file_digest(dst) == managed[item]:
+                    dst.unlink()
             if dst.is_dir() and item in STATE_DIRS:
                 moved = merge_dir(src, dst, tag)
                 dst.rmdir()
-                dst.symlink_to(src)
+                make_shared_link(src, dst)
                 done.append((item, moved, None))
             elif not dst.exists():
-                dst.symlink_to(src)
+                kind = make_shared_link(src, dst)
+                if kind == "hardlink":
+                    managed[item] = file_digest(dst)
                 done.append((item, 0, None))
         except OSError as e:
             done.append((item, 0, e))
+    if managed != before:
+        write_json(manifest_path, managed)
     return done
 
 
@@ -837,9 +1024,11 @@ def link_problems(cfg, name):
     problems = []
     for item in shared_items(cfg["profiles"][name].get("share_history", True)):
         src, dst = claude_home() / item, d / item
-        if dst.is_symlink():
+        if dst.is_symlink() or is_junction(dst):
             if dst.resolve() != src.resolve():
                 problems.append((item, tr("다른 곳을 가리킴", "points elsewhere"), False))
+        elif WINDOWS and src.is_file() and dst.is_file() and dst.samefile(src):
+            continue
         elif dst.is_dir() and item in STATE_DIRS:
             problems.append((item, tr("계정 폴더에 따로 있어 공유되지 않음", "separate copy in the account folder, not shared"), True))
         elif dst.exists():
@@ -851,11 +1040,13 @@ def link_problems(cfg, name):
 
 def remove_profile_dir(d):
     root = (ccm_home() / "profiles").resolve()
-    if d.is_symlink() or d.resolve().parent != root:
+    if d.is_symlink() or is_junction(d) or d.resolve().parent != root:
         raise CcmError(tr(f"프로필 폴더 위치가 예상과 다릅니다: {d}", f"Unexpected profile folder location: {d}"))
     # 공유 항목은 링크만 지우고 링크가 가리키는 ~/.claude 쪽 원본은 그대로 둔다
     for entry in d.iterdir():
-        if entry.is_symlink():
+        if is_junction(entry):
+            entry.rmdir()
+        elif entry.is_symlink():
             entry.unlink()
     shutil.rmtree(d)
 
@@ -870,13 +1061,15 @@ def launch(name, claude_args, announce=True):
     sys.stdout.flush()
     sys.stderr.flush()
     try:
+        if WINDOWS:
+            return subprocess.call(claude_command(*claude_args), env=profile_env(name))
         os.execvpe(exe, [exe, *claude_args], profile_env(name))
     except OSError as e:
         raise CcmError(tr(f"claude를 실행하지 못했습니다: {e}", f"Could not start claude: {e}"))
 
 
 def login_flow(cfg, name, email=None, sso=False):
-    cmd = [claude_bin(), "auth", "login"]
+    cmd = claude_command("auth", "login")
     if email:
         cmd += ["--email", email]
     if sso:
@@ -914,10 +1107,33 @@ def login_flow(cfg, name, email=None, sso=False):
 
 def is_ccm_statusline(sl):
     cmd = ((sl or {}).get("command") or "").rstrip()
-    return cmd.endswith(" statusline") and "ccm" in cmd
+    return bool(encoded_statusline_paths(cmd)) or cmd.endswith(" statusline") and "ccm" in cmd
+
+
+def encoded_statusline_paths(cmd):
+    match = re.search(r"-EncodedCommand\s+([A-Za-z0-9+/=]+)$", cmd, re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        script = base64.b64decode(match[1], validate=True).decode("utf-16-le")
+        header = script.splitlines()[0]
+        if not header.startswith("# ccm-statusline "):
+            return None
+        paths = json.loads(header[len("# ccm-statusline "):])
+        if isinstance(paths, list) and len(paths) == 2 and all(isinstance(p, str) for p in paths):
+            return paths
+    except (ValueError, UnicodeError, IndexError):
+        pass
+    return None
 
 
 def statusline_command():
+    if WINDOWS:
+        paths = [Path(sys.executable).as_posix(), script_path().as_posix()]
+        script = ("# ccm-statusline " + json.dumps(paths, ensure_ascii=True) + "\n"
+                  + f"& {ps_quote(paths[0])} -X utf8 {ps_quote(paths[1])} statusline\nexit $LASTEXITCODE")
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        return f"powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}"
     return f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path()))} statusline"
 
 
@@ -932,7 +1148,8 @@ def statusline_problem():
         return tr("상태줄이 연결되어 있지 않아 사용량이 기록되지 않습니다. `ccm setup`을 실행하세요.",
                   "The status line isn't connected, so usage isn't recorded. Run `ccm setup`."), False
     try:
-        words = shlex.split(sl["command"])
+        paths = encoded_statusline_paths(sl["command"])
+        words = [*paths, "statusline"] if paths else shlex.split(sl["command"])
     except ValueError:
         return None
     if len(words) >= 3 and not shutil.which(words[-3]):
@@ -951,6 +1168,20 @@ def statusline_problem():
 def install_link_problem():
     """PATH의 ccm 명령을 점검한다. 문제가 없으면 None, 있으면 (안내문, `doctor --fix`로 고칠 수 있는지)를 돌려준다."""
     link, here = bin_dir() / "ccm", Path(__file__).resolve()
+    if WINDOWS:
+        expected = windows_launchers()
+        stale = [name for name, content in expected.items()
+                 if read_launcher(bin_dir() / name) != content]
+        if stale:
+            return tr(f"Windows 실행 파일 설치 또는 갱신 필요: {', '.join(stale)} (`.\\install.ps1`)",
+                      f"Windows launchers need installing or updating: {', '.join(stale)} (`.\\install.ps1`)"), True
+        found = shutil.which("ccm")
+        if not found:
+            return tr(f"PATH에 {bin_dir()} 폴더가 없습니다 (`.\\install.ps1`)",
+                      f"{bin_dir()} isn't on PATH (`.\\install.ps1`)"), False
+        if Path(found).parent.resolve() != bin_dir().resolve():
+            return tr(f"PATH의 ccm이 다른 폴더에 있습니다: {found}", f"ccm on PATH is in another folder: {found}"), False
+        return None
     if link.is_symlink() and not link.exists():
         return tr(f"{link} 링크가 가리키는 {os.readlink(link)} 파일이 없습니다",
                   f"{link} points to {os.readlink(link)}, which doesn't exist"), True
@@ -965,10 +1196,45 @@ def install_link_problem():
 
 def relink_install():
     """install.sh처럼 ccm 링크가 이 파일을 가리키게 다시 만든다."""
+    if WINDOWS:
+        for name, content in windows_launchers().items():
+            write_text(bin_dir() / name, ("\ufeff" if name.endswith(".ps1") else "") + content)
+        return
     link = bin_dir() / "ccm"
     if link.is_symlink():
         link.unlink()
     link.symlink_to(Path(__file__).resolve())
+
+
+def read_launcher(path):
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return None
+
+
+def windows_launchers():
+    python, script = str(Path(sys.executable)), str(Path(__file__).resolve())
+    cmd_python, cmd_script = python.replace("%", "%%"), script.replace("%", "%%")
+    cmd = (
+        '@echo off\nsetlocal DisableDelayedExpansion\n'
+        'for /f "tokens=2 delims=:" %%C in (\'chcp\') do set "_ccmCodePage=%%C"\n'
+        'chcp 65001 >nul\n'
+        f'"{cmd_python}" -X utf8 "{cmd_script}" %*\n'
+        'set "_ccmExit=%errorlevel%"\n'
+        'if defined _ccmCodePage chcp %_ccmCodePage% >nul\n'
+        'exit /b %_ccmExit%\n')
+    ps = (
+        "$ccmOldProfile = $env:CCM_POWERSHELL_PROFILE\n"
+        "try {\n"
+        "    if (-not $env:CCM_POWERSHELL_PROFILE) { $env:CCM_POWERSHELL_PROFILE = $PROFILE.CurrentUserAllHosts }\n"
+        f"    & {ps_quote(python)} -X utf8 {ps_quote(script)} @args\n"
+        "    $ccmStatus = $LASTEXITCODE\n"
+        "} finally {\n"
+        "    $env:CCM_POWERSHELL_PROFILE = $ccmOldProfile\n"
+        "}\n"
+        "exit $ccmStatus\n")
+    return {"ccm.cmd": cmd, "ccm.ps1": ps}
 
 
 def run_wrapped(cmd, raw):
@@ -979,10 +1245,20 @@ def run_wrapped(cmd, raw):
     if not cmd or is_ccm_statusline({"command": cmd}):
         return ""
     try:
-        r = subprocess.run(cmd, shell=True, input=raw, capture_output=True, timeout=10)
+        if WINDOWS:
+            bash = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+            git = shutil.which("git")
+            if not bash and git:
+                candidate = Path(git).resolve().parent.parent / "bin" / "bash.exe"
+                if candidate.is_file():
+                    bash = str(candidate)
+            command = [bash, "-c", cmd] if bash else [powershell_bin(), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd]
+            r = subprocess.run(command, input=raw, capture_output=True, timeout=10)
+        else:
+            r = subprocess.run(cmd, shell=True, input=raw, capture_output=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    return r.stdout.decode("utf-8", "replace").rstrip("\n")
+    return r.stdout.decode("utf-8", "replace").rstrip("\r\n")
 
 
 def status_segment(label, rec, paint, now):
@@ -1003,6 +1279,25 @@ def status_segment(label, rec, paint, now):
 # ---------- 셸 함수 ----------
 
 def shell_function():
+    if WINDOWS:
+        f = ps_quote(ccm_home() / "current-dir")
+        return (
+            f"{RC_BEGIN}\n"
+            "$env:CCM_SHELL_HOOK = '1'\n"
+            "function global:claude {\n"
+            "    $ccmPreviousDir = $env:CLAUDE_CONFIG_DIR\n"
+            "    try {\n"
+            f"        if (-not $ccmPreviousDir -and (Test-Path -LiteralPath {f})) {{\n"
+            f"            $ccmSelectedDir = [IO.File]::ReadAllText({f}, [Text.Encoding]::UTF8).Trim()\n"
+            "            if ($ccmSelectedDir) { $env:CLAUDE_CONFIG_DIR = $ccmSelectedDir }\n"
+            "        }\n"
+            "        $ccmCommand = Get-Command claude -CommandType Application -ErrorAction Stop | Select-Object -First 1\n"
+            "        & $ccmCommand.Source @args\n"
+            "    } finally {\n"
+            "        $env:CLAUDE_CONFIG_DIR = $ccmPreviousDir\n"
+            "    }\n"
+            "}\n"
+            f"{RC_END}\n")
     f = shlex.quote(str(ccm_home() / "current-dir"))
     return (
         f"{RC_BEGIN}\n"
@@ -1157,6 +1452,12 @@ def sync_profiles(source, targets, replace=False, dry_run=False):
 
 # ---------- 명령 ----------
 
+def cmd_install(args):
+    relink_install()
+    print(tr("설치한 폴더", "Installed in") + f": {bin_dir()}")
+    return 0
+
+
 def cmd_pick(args):
     cfg = load_config()
     ensure_shared(cfg)
@@ -1263,6 +1564,12 @@ def cmd_add(args):
     d.mkdir(mode=0o700, parents=True)
     share_history = not args.no_share_history
     linked = repair_links(d, share_history, name)
+    errors = [str(error) for _, _, error in linked if error]
+    if errors:
+        remove_profile_dir(d)
+        raise CcmError(tr("공유 링크를 만들지 못했습니다: ", "Could not create shared links: ") + "; ".join(errors)
+                       + (tr(". Windows에서는 두 폴더를 같은 NTFS 드라이브에 두거나 개발자 모드를 켜세요.",
+                             ". On Windows, keep both folders on the same NTFS drive or enable Developer Mode.") if WINDOWS else ""))
     cfg["profiles"][name] = {"created_at": time.time(), "share_history": share_history}
     save_config(cfg)
     print(tr(f"프로필 폴더를 만들었습니다: {d}", f"Created profile folder: {d}"))
@@ -1302,7 +1609,7 @@ def cmd_rm(args):
     if d.is_dir():
         # 키체인에 남은 이 프로필의 로그인 항목은 Claude Code가 직접 지우게 한다
         try:
-            subprocess.run([claude_bin(), "auth", "logout"], env=profile_env(name),
+            subprocess.run(claude_command("auth", "logout"), env=profile_env(name),
                            stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
         except (OSError, subprocess.TimeoutExpired) as e:
             print(tr(f"주의: 로그아웃하지 못했습니다({e}).", f"Note: logout failed ({e})."), file=sys.stderr)
@@ -1404,7 +1711,7 @@ def uninstall_statusline():
 
 def install_shell_hook():
     rc = rc_file()
-    text = rc.read_text(encoding="utf-8") if rc.exists() else ""
+    text = read_rc(rc)
     if RC_BEGIN in text:
         new = strip_rc_block(text)
         new = new + ("" if not new or new.endswith("\n") else "\n") + "\n" + shell_function()
@@ -1414,7 +1721,7 @@ def install_shell_hook():
         status = tr("추가했습니다", "added")
     if new == text:
         return tr("이미 설치되어 있습니다", "already installed")
-    write_text(rc, new, 0o644)
+    write_rc(rc, new)
     return status
 
 
@@ -1422,28 +1729,35 @@ def uninstall_shell_hook():
     rc = rc_file()
     if not rc.exists():
         return tr("설치되어 있지 않습니다", "not installed")
-    text = rc.read_text(encoding="utf-8")
+    text = read_rc(rc)
     if RC_BEGIN not in text:
         return tr("설치되어 있지 않습니다", "not installed")
-    write_text(rc, strip_rc_block(text), 0o644)
+    write_rc(rc, strip_rc_block(text))
     return tr("지웠습니다", "removed")
 
 
 def cmd_setup(args):
     rc = rc_file()
     sl, fn = tr("상태줄", "Status line"), tr("셸 함수", "Shell function")
+    if WINDOWS:
+        ensure_shared(load_config())
     if args.undo:
         print(f"{sl}: {uninstall_statusline()}")
         print(f"{fn} ({rc}): {uninstall_shell_hook()}")
+        if WINDOWS:
+            ensure_shared(load_config())
         return 0
     print(f"{sl} ({settings_path()}): {install_statusline()}")
+    if WINDOWS:
+        ensure_shared(load_config())
     if args.no_shell:
         print(tr("셸 함수는 설치하지 않았습니다. 직접 넣으려면 `ccm shell-init` 출력을 셸 설정 파일에 붙이세요.",
                  "Shell function not installed. To add it yourself, paste the output of `ccm shell-init` into your shell config."))
     else:
         print(f"{fn} ({rc}): {install_shell_hook()}")
-        print(tr(f"새 터미널을 열거나 `source {rc}`를 실행하면 `claude`가 현재 계정으로 실행됩니다.",
-                 f"Open a new terminal or run `source {rc}`, and `claude` will start with the current account."))
+        reload = f". {ps_quote(rc)}" if WINDOWS else f"source {shlex.quote(str(rc))}"
+        print(tr(f"새 터미널을 열거나 `{reload}`를 실행하면 `claude`가 현재 계정으로 실행됩니다.",
+                 f"Open a new terminal or run `{reload}`, and `claude` will start with the current account."))
     return 0
 
 
@@ -1474,7 +1788,10 @@ def cmd_doctor(args):
     link = install_link_problem()
     if link and link[1] and args.fix:
         relink_install()
-        print("  · " + tr("ccm 링크를 다시 만들었습니다", "recreated the ccm link") + f": {bin_dir() / 'ccm'} -> {Path(__file__).resolve()}")
+        if WINDOWS:
+            print("  · " + tr("Windows 실행 파일을 갱신했습니다", "updated Windows launchers") + f": {bin_dir()}")
+        else:
+            print("  · " + tr("ccm 링크를 다시 만들었습니다", "recreated the ccm link") + f": {bin_dir() / 'ccm'} -> {Path(__file__).resolve()}")
         link = install_link_problem()
     cmd_label = tr("ccm 명령", "ccm command")
     if link:
@@ -1487,7 +1804,7 @@ def cmd_doctor(args):
         sl = statusline_problem()
     report(sl is None, tr("상태줄 연결", "status line connected") if sl is None else sl[0])
     rc = rc_file()
-    hooked = rc.exists() and RC_BEGIN in rc.read_text(encoding="utf-8")
+    hooked = rc.exists() and RC_BEGIN in read_rc(rc)
     report(hooked, tr(f"셸 함수 {rc}" + ("" if hooked else " 에 없음 (`ccm setup`)"),
                       f"shell function in {rc}" if hooked else f"shell function not found in {rc} (`ccm setup`)"))
     seen = {}
@@ -1545,6 +1862,9 @@ def build_parser():
                        "Run without arguments to pick an account from the usage table with the arrow keys and start claude."))
     ap.add_argument("--version", action="version", version=f"ccm {VERSION}")
     sub = ap.add_subparsers(dest="cmd", metavar=tr("명령", "command"))
+    if WINDOWS:
+        p = sub.add_parser("install", help=tr("Windows 명령 실행 파일 설치·갱신", "install or update Windows launchers"))
+        p.set_defaults(func=cmd_install)
     no_launch = tr("계정만 바꾸고 claude는 실행하지 않음", "switch only; don't start claude")
     name_help = tr("이름, 번호, 이메일 일부", "name, number, or part of the email")
 
@@ -1633,6 +1953,10 @@ def build_parser():
 
 
 def main(argv=None):
+    if WINDOWS:
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-n", "--no-launch", "--"):
         argv = ["pick"] + argv
@@ -1649,8 +1973,14 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     args.claude_args = claude_args
     try:
+        if WINDOWS:
+            with terminal_mode(None):
+                return args.func(args)
         return args.func(args)
     except CcmError as e:
+        print(f"ccm: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
         print(f"ccm: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

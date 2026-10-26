@@ -4,22 +4,28 @@
 임시 폴더를 만들고 가짜 claude(tests/fake_claude.py)로 로그인 상태를 흉내 낸다.
 """
 
-import fcntl
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
-import pty
 import select
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
+
+WINDOWS = os.name == "nt"
+if not WINDOWS:
+    import fcntl
+    import pty
+    import termios
 
 # 테스트가 ccm을 불러올 때 프로젝트 폴더에 __pycache__를 남기지 않게 한다
 sys.dont_write_bytecode = True
@@ -108,17 +114,19 @@ class CcmTest(unittest.TestCase):
         (self.claude_home / "skills" / "demo").mkdir(parents=True)
         (self.claude_home / "projects" / "p1").mkdir(parents=True)
         (self.claude_home / "projects" / "p1" / "s.jsonl").write_text("{}\n")
-        (self.claude_home / "CLAUDE.md").write_text("# 지침\n")
+        (self.claude_home / "CLAUDE.md").write_text("# 지침\n", encoding="utf-8")
         self.settings = self.claude_home / "settings.json"
+        previous = "powershell.exe -NoProfile -Command 'Write-Output base'" if WINDOWS else "printf base"
         self.settings.write_text(json.dumps(
-            {"model": "opus", "statusLine": {"type": "command", "command": "printf base", "padding": 0}},
+            {"model": "opus", "statusLine": {"type": "command", "command": previous, "padding": 0}},
             indent=2) + "\n")
         self.home = self.root / "home"
         self.home.mkdir()
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        fake = self.bin / "claude"
-        fake.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+        fake = self.bin / ("claude.cmd" if WINDOWS else "claude")
+        fake.write_text((f'@echo off\n"{sys.executable}" -X utf8 "{FAKE}" %*\n' if WINDOWS
+                         else f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n'), encoding="utf-8")
         fake.chmod(0o755)
         self.log = self.root / "claude.log"
         self.local_bin = self.root / "local-bin"
@@ -129,10 +137,13 @@ class CcmTest(unittest.TestCase):
         self.env.update(
             CCM_HOME=str(self.root / "ccm"),
             CCM_CLAUDE_HOME=str(self.claude_home),
-            CCM_CLAUDE_BIN=str(fake),
+            CCM_CLAUDE_BIN=str(FAKE if WINDOWS else fake),
             CCM_BIN_DIR=str(self.local_bin),
             CCM_LANG="ko",   # 기존 테스트는 한국어 출력을 확인한다. 영어 출력은 따로 확인한다
             HOME=str(self.home),
+            USERPROFILE=str(self.home),
+            CCM_POWERSHELL_PROFILE=str(self.home / "profile.ps1"),
+            PYTHONUTF8="1",
             SHELL="/bin/zsh",
             FAKE_CLAUDE_LOG=str(self.log),
             FAKE_DEFAULT_DIR=str(self.claude_home),
@@ -142,13 +153,14 @@ class CcmTest(unittest.TestCase):
         )
 
     def tearDown(self):
+        assert self.root.resolve().parent == TMP_BASE.resolve()
         shutil.rmtree(self.root, ignore_errors=True)
 
     # ---------- 도우미 ----------
 
     def ccm(self, *args, env=None, input=None, code=0):
         r = subprocess.run([sys.executable, str(CCM), *args], env=env or self.env, input=input,
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, encoding="utf-8", timeout=60)
         if code is not None and r.returncode != code:
             self.fail(f"ccm {' '.join(args)} → {r.returncode}\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}")
         return r
@@ -160,6 +172,21 @@ class CcmTest(unittest.TestCase):
 
     def pdir(self, name):
         return self.root / "ccm" / "profiles" / name
+
+    def assert_shared(self, path):
+        src = self.claude_home / path.name
+        self.assertTrue(path.samefile(src), str(path))
+        if src.is_dir():
+            self.assertTrue(path.is_symlink() or load_module().is_junction(path), str(path))
+
+    def unlink_shared(self, path):
+        if WINDOWS and load_module().is_junction(path):
+            path.rmdir()
+        else:
+            path.unlink()
+
+    def rc_path(self):
+        return self.home / ("profile.ps1" if WINDOWS else ".zshrc")
 
     def config(self):
         return json.loads((self.root / "ccm" / "config.json").read_text())
@@ -186,8 +213,7 @@ class CcmTest(unittest.TestCase):
         r = self.ccm("add", "work", "--email", "w@example.com")
         d = self.pdir("work")
         for item in ("settings.json", "CLAUDE.md", "skills", "projects"):
-            self.assertTrue((d / item).is_symlink(), item)
-            self.assertEqual((d / item).resolve(), (self.claude_home / item).resolve())
+            self.assert_shared(d / item)
         self.assertEqual(self.config()["profiles"]["work"]["info"]["email"], "w@example.com")
         self.assertIn("로그인 완료: work → w@example.com", r.stdout)
         login = [c for c in self.calls() if c["args"][:2] == ["auth", "login"]]
@@ -199,15 +225,14 @@ class CcmTest(unittest.TestCase):
         self.ccm("add", "work")
         for item in ("tasks", "teams", "sessions", "paste-cache", "session-env", "todos", "plans"):
             self.assertTrue((self.claude_home / item).is_dir(), item)
-            self.assertTrue((self.pdir("work") / item).is_symlink(), item)
+            self.assert_shared(self.pdir("work") / item)
 
     def test_add_shares_user_config_dirs_and_loop_file(self):
         (self.claude_home / "loop.md").write_text("loop\n")
         self.ccm("add", "solo", "--no-share-history")
         d = self.pdir("solo")
         for item in ("rules", "workflows", "themes", "agent-memory", "loop.md"):
-            self.assertTrue((d / item).is_symlink(), item)
-            self.assertEqual((d / item).resolve(), (self.claude_home / item).resolve())
+            self.assert_shared(d / item)
         self.assertTrue((self.claude_home / "agent-memory").is_dir())
 
     def test_add_copies_mcp_servers_and_trust_from_default(self):
@@ -230,7 +255,7 @@ class CcmTest(unittest.TestCase):
         self.ccm("add", "work")
         d, shared = self.pdir("work"), self.claude_home / "tasks"
         # Claude Code가 계정 폴더 안에 tasks를 따로 만든 상황을 흉내 낸다
-        (d / "tasks").unlink()
+        self.unlink_shared(d / "tasks")
         (d / "tasks" / "session-aaa").mkdir(parents=True)
         (d / "tasks" / "session-aaa" / "1.json").write_text("work")
         (d / "tasks" / "session-bbb").mkdir()
@@ -242,7 +267,7 @@ class CcmTest(unittest.TestCase):
 
         r = self.ccm("ls")
         self.assertIn("[work] ~/.claude와 공유하도록 연결했습니다: tasks(따로 있던 3개 옮김)", r.stderr)
-        self.assertTrue((d / "tasks").is_symlink())
+        self.assert_shared(d / "tasks")
         self.assertEqual(sorted(p.name for p in (shared / "session-aaa").iterdir()), ["1.json", "2.json"])
         self.assertTrue((shared / "session-bbb").is_dir())
         self.assertEqual((shared / "note.json").read_text(), "main")
@@ -254,7 +279,7 @@ class CcmTest(unittest.TestCase):
     def test_doctor_finds_split_state_dirs(self):
         self.ccm("add", "work")
         d = self.pdir("work")
-        (d / "sessions").unlink()
+        self.unlink_shared(d / "sessions")
         (d / "sessions").mkdir()
         (d / "sessions" / "123.json").write_text("{}")
         out = self.ccm("doctor", code=None).stdout
@@ -267,7 +292,7 @@ class CcmTest(unittest.TestCase):
     def test_add_without_history_sharing(self):
         self.ccm("add", "solo", "--no-share-history")
         d = self.pdir("solo")
-        self.assertTrue((d / "settings.json").is_symlink())
+        self.assert_shared(d / "settings.json")
         self.assertFalse((d / "projects").exists())
 
     def test_add_rejects_bad_or_duplicate_names(self):
@@ -315,7 +340,7 @@ class CcmTest(unittest.TestCase):
         out = self.ccm("ls", env={**self.env, "ANTHROPIC_API_KEY": "x"}).stdout
         self.assertIn("w@example.com", out)
         self.assertNotIn("API 키 사용 중", out)
-        self.assertIn("unset ANTHROPIC_API_KEY", out)
+        self.assertIn("Remove-Item Env:ANTHROPIC_API_KEY" if WINDOWS else "unset ANTHROPIC_API_KEY", out)
 
         # Claude Code 세션 안에서 실행하면 세션에서 물려받은 값이라고 안내한다
         out = self.ccm("ls", env={**self.env, "ANTHROPIC_API_KEY": "x", "CLAUDECODE": "1"}).stdout
@@ -341,20 +366,28 @@ class CcmTest(unittest.TestCase):
         self.ccm("setup", "--no-shell")
         moved = self.root / "old-place" / "ccm"
         settings = json.loads(self.settings.read_text())
-        settings["statusLine"]["command"] = f"{sys.executable} {moved} statusline"
+        settings["statusLine"]["command"] = f"{shlex.quote(Path(sys.executable).as_posix())} {shlex.quote(moved.as_posix())} statusline"
         self.settings.write_text(json.dumps(settings))
         self.assertIn("`./ccm doctor --fix`", self.ccm("ls").stdout)
-        self.assertIn(f"{moved} 파일이 없어", self.ccm("doctor", code=1).stdout)
+        self.assertIn(f"{moved.as_posix()} 파일이 없어", self.ccm("doctor", code=1).stdout)
         self.ccm("doctor", "--fix", code=None)
         self.assertNotIn(str(moved), json.loads(self.settings.read_text())["statusLine"]["command"])
         self.assertNotIn("사용량이 기록되지 않습니다", self.ccm("ls").stdout)
 
         settings = json.loads(self.settings.read_text())
-        settings["statusLine"]["command"] = f"/nonexistent/python3 {CCM} statusline"
+        settings["statusLine"]["command"] = f"/nonexistent/python3 {shlex.quote(CCM.as_posix())} statusline"
         self.settings.write_text(json.dumps(settings))
         self.assertIn("Python(/nonexistent/python3)이 없어", self.ccm("ls").stdout)
 
     def test_doctor_relinks_install_link_after_folder_move(self):
+        if WINDOWS:
+            link = self.local_bin / "ccm.cmd"
+            link.write_text('@echo off\n"C:\\old-place\\python.exe" ccm %*\n', encoding="utf-8")
+            self.assertIn("Windows 실행 파일 설치 또는 갱신 필요", self.ccm("doctor", code=1).stdout)
+            self.ccm("doctor", "--fix", code=None)
+            self.assertIn(str(CCM), link.read_text(encoding="utf-8"))
+            self.assertNotIn("Windows 실행 파일 설치 또는 갱신 필요", self.ccm("doctor", code=None).stdout)
+            return
         link = self.local_bin / "ccm"
         link.symlink_to(self.root / "old-place" / "ccm")
         self.assertIn(f"{link} 링크가 가리키는", self.ccm("doctor", code=1).stdout)
@@ -370,7 +403,7 @@ class CcmTest(unittest.TestCase):
         self.ccm("setup", "--no-shell")
         settings = json.loads(self.settings.read_text())
         command = settings["statusLine"]["command"]
-        self.assertTrue(command.endswith(" statusline"))
+        self.assertTrue(load_module().is_ccm_statusline({"command": command}))
         self.assertEqual(settings["statusLine"]["padding"], 0)
         self.assertEqual(settings["model"], "opus")
         self.assertTrue(list(self.claude_home.glob("settings.json.ccm-backup-*")))
@@ -382,14 +415,14 @@ class CcmTest(unittest.TestCase):
         }}
         env = {**self.env, "CLAUDE_CONFIG_DIR": str(self.pdir("work"))}
         r = subprocess.run(command, shell=True, input=json.dumps(payload), env=env,
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, encoding="utf-8", timeout=30)
         self.assertTrue(r.stdout.startswith("base  [work] 5h 72% ↻"), r.stdout)
         self.assertIn("· 7d 31% ↻", r.stdout)
         rec = json.loads((self.root / "ccm" / "usage" / "work.json").read_text())
         self.assertEqual(rec["windows"]["five_hour"]["used_percentage"], 72.4)
 
         # rate_limits가 없는 호출(세션 첫 응답 전)은 마지막 기록을 보여 주고 기록은 바꾸지 않는다
-        r = subprocess.run(command, shell=True, input="{}", env=env, capture_output=True, text=True)
+        r = subprocess.run(command, shell=True, input="{}", env=env, capture_output=True, encoding="utf-8")
         self.assertIn("[work] 5h 72%", r.stdout)
 
     def test_statusline_ignores_older_values_from_idle_sessions(self):
@@ -435,11 +468,17 @@ class CcmTest(unittest.TestCase):
     def test_use_and_shell_function(self):
         self.ccm("add", "work")
         self.ccm("setup")
-        rc = self.home / ".zshrc"
+        rc = self.rc_path()
 
         def run_claude(extra_env=None):
             env = {**self.env, **(extra_env or {})}
-            subprocess.run(["zsh", "-f", "-c", f"source {rc}; claude hello"], env=env, check=True, timeout=30)
+            if WINDOWS:
+                cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                       f". {load_module().ps_quote(rc)}; claude hello"]
+            else:
+                shell = "zsh" if shutil.which("zsh") else "bash"
+                cmd = [shell, "-f", "-c", f"source {shlex.quote(str(rc))}; claude hello"]
+            subprocess.run(cmd, env=env, check=True, timeout=30)
             return self.calls()[-1]
 
         self.assertIn("셸 함수", self.ccm("use", "work").stdout)
@@ -524,6 +563,7 @@ class CcmTest(unittest.TestCase):
         self.ccm("next", "-n")
         self.assertEqual(self.config()["current"], "c")
 
+    @unittest.skipIf(WINDOWS, "POSIX PTY; Windows console is tested separately")
     def test_pick_moves_with_arrow_keys_and_launches(self):
         self.ccm("add", "work", "--email", "w@example.com")
         self.ccm("add", "side", "--email", "s@example.com")
@@ -546,6 +586,7 @@ class CcmTest(unittest.TestCase):
         self.assertEqual(self.calls()[-1], {"args": ["-c"], "config_dir": str(self.pdir("work"))})
         self.assertEqual(self.config()["current"], "work")
 
+    @unittest.skipIf(WINDOWS, "POSIX PTY; Windows console is tested separately")
     def test_pick_number_key_moves_cursor(self):
         self.ccm("add", "work")
         self.ccm("add", "side")
@@ -560,6 +601,7 @@ class CcmTest(unittest.TestCase):
         self.assertEqual(self.config()["current"], "side")
         self.assertFalse([c for c in self.calls() if not c["args"][:1] == ["auth"]])
 
+    @unittest.skipIf(WINDOWS, "POSIX PTY; Windows console is tested separately")
     def test_pick_esc_asks_before_exit(self):
         self.ccm("add", "work")
         s = PtySession([], self.env)
@@ -583,6 +625,7 @@ class CcmTest(unittest.TestCase):
         self.assertEqual(self.config()["current"], "default")
         self.assertFalse([c for c in self.calls() if not c["args"][:1] == ["auth"]])
 
+    @unittest.skipIf(WINDOWS, "POSIX PTY; Windows console is tested separately")
     def test_pick_enter_confirms_exit(self):
         s = PtySession([], self.env)
         s.expect("ESC 종료")
@@ -593,6 +636,7 @@ class CcmTest(unittest.TestCase):
         s.close()
         self.assertEqual(s.p.returncode, 0)
 
+    @unittest.skipIf(WINDOWS, "POSIX PTY; Windows console is tested separately")
     def test_pick_ctrl_c_exits_without_confirm(self):
         s = PtySession([], self.env)
         s.expect("ESC 종료")
@@ -625,17 +669,17 @@ class CcmTest(unittest.TestCase):
         self.assertIn("지울 수 없습니다", self.ccm("rm", "default", "-y", code=1).stderr)
 
     def test_setup_is_idempotent_and_undo_restores(self):
-        rc = self.home / ".zshrc"
+        rc = self.rc_path()
         rc.write_text("export FOO=1\n")
         original_settings = json.loads(self.settings.read_text())
         self.ccm("setup")
         r = self.ccm("setup")
         self.assertIn("이미 연결", r.stdout)
         self.assertIn("이미 설치", r.stdout)
-        self.assertEqual(rc.read_text().count("# >>> ccm >>>"), 1)
+        self.assertEqual(rc.read_text(encoding="utf-8-sig").count("# >>> ccm >>>"), 1)
         self.ccm("setup", "--undo")
         self.assertEqual(json.loads(self.settings.read_text()), original_settings)
-        self.assertEqual(rc.read_text(), "export FOO=1\n")
+        self.assertEqual(rc.read_text(encoding="utf-8-sig"), "export FOO=1\n")
 
     def test_setup_without_previous_statusline(self):
         self.settings.write_text(json.dumps({"model": "opus"}) + "\n")
@@ -658,7 +702,7 @@ class CcmTest(unittest.TestCase):
         self.assertIn("settings.json: 별도 파일로 바뀌어 공유되지 않음", r.stdout)
         self.assertIn("CLAUDE.md: 연결 없음", r.stdout)
         self.ccm("doctor", "--fix", code=1)
-        self.assertTrue((d / "CLAUDE.md").is_symlink())
+        self.assert_shared(d / "CLAUDE.md")
 
 
     # ---------- 출력 언어 ----------
@@ -707,6 +751,7 @@ class CcmTest(unittest.TestCase):
         self.assertNotIn("lang", self.config())
         self.assertIn("Claude Code accounts", self.ccm("ls", env=en_locale).stdout)
 
+    @unittest.skipIf(WINDOWS, "POSIX PTY; Windows console is tested separately")
     def test_pick_in_english(self):
         self.ccm("add", "work", env=self.env_en())
         s = PtySession([], self.env_en())
@@ -761,6 +806,158 @@ class CcmTest(unittest.TestCase):
         self.ccm("sync")
         self.assertGreaterEqual(time.time() - started, 0.9)
         self.assertIn("a", json.loads((self.pdir("work") / ".claude.json").read_text())["mcpServers"])
+
+    # ---------- Windows ----------
+
+    @unittest.skipUnless(WINDOWS, "Windows installer")
+    def test_windows_installer_and_both_launchers(self):
+        installed = self.local_bin / "한글 & [bin]'"
+        source = self.root / "한글 & [repo]' %PATH% !"
+        source.mkdir()
+        shutil.copyfile(CCM, source / "ccm")
+        shutil.copyfile(ROOT / "install.ps1", source / "install.ps1")
+        result = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(source / "install.ps1"),
+             "-Python", sys.executable, "-BinDir", str(installed), "-NoPath"],
+            env=self.env, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for command in ([str(installed / "ccm.cmd"), "--version"],
+                        ["powershell.exe", "-NoProfile", "-File", str(installed / "ccm.ps1"), "--version"]):
+            result = subprocess.run(command, env=self.env, capture_output=True, encoding="utf-8", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"ccm {load_module().VERSION}", result.stdout)
+
+    @unittest.skipUnless(WINDOWS, "Windows process handling")
+    def test_windows_run_propagates_exit_code_and_arguments(self):
+        self.ccm("add", "work")
+        self.ccm("run", "work", "--model", "value with spaces", env={**self.env, "FAKE_EXIT_CODE": "7"}, code=7)
+        self.assertEqual(self.calls()[-1]["args"], ["--model", "value with spaces"])
+
+    @unittest.skipUnless(WINDOWS, "PowerShell environment restoration")
+    def test_windows_shell_function_restores_environment_after_failure(self):
+        self.ccm("add", "work")
+        self.ccm("use", "work")
+        self.ccm("setup")
+        command = (f". {load_module().ps_quote(self.rc_path())}; "
+                   "$ccmBefore = $env:CLAUDE_CONFIG_DIR; claude 'argument with spaces'; "
+                   "$ccmResult = $LASTEXITCODE; "
+                   "if ($env:CLAUDE_CONFIG_DIR -ne $ccmBefore) { exit 99 }; exit $ccmResult")
+        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                                env={**self.env, "FAKE_EXIT_CODE": "7"}, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(self.calls()[-1], {"args": ["argument with spaces"], "config_dir": str(self.pdir("work"))})
+
+    @unittest.skipUnless(WINDOWS, "Windows path quoting")
+    def test_windows_statusline_supports_special_paths_in_both_shells(self):
+        location = self.root / "한글 & [repo]'"
+        location.mkdir()
+        script = location / "ccm"
+        shutil.copyfile(CCM, script)
+        self.ccm("add", "work")
+        setup = subprocess.run([sys.executable, str(script), "setup", "--no-shell"],
+                               env=self.env, capture_output=True, timeout=30)
+        self.assertEqual(setup.returncode, 0, setup.stderr)
+        command = json.loads(self.settings.read_text())["statusLine"]["command"]
+        payload = json.dumps({"rate_limits": {"five_hour": {"used_percentage": 23, "resets_at": time.time() + 600}}})
+        env = {**self.env, "CLAUDE_CONFIG_DIR": str(self.pdir("work"))}
+        shells = [["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]]
+        git = shutil.which("git")
+        bash = Path(git).resolve().parent.parent / "bin" / "bash.exe" if git else None
+        if bash and bash.exists():
+            shells.append([str(bash), "-c", command])
+        for argv in shells:
+            result = subprocess.run(argv, input=payload, env=env, capture_output=True, encoding="utf-8", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("base  [work] 5h 23%", result.stdout)
+
+    @unittest.skipUnless(WINDOWS, "Windows hard links")
+    def test_windows_repairs_hard_links_after_atomic_save_and_keeps_private_edits(self):
+        self.ccm("add", "work")
+        replacement = self.settings.with_suffix(".new")
+        replacement.write_text('{"model": "sonnet"}', encoding="utf-8")
+        os.replace(replacement, self.settings)
+        self.ccm("ls")
+        self.assert_shared(self.pdir("work") / "settings.json")
+        private = self.pdir("work") / "settings.json"
+        private.unlink()
+        private.write_text('{"model": "private"}', encoding="utf-8")
+        self.ccm("ls")
+        self.assertEqual(json.loads(private.read_text())["model"], "private")
+        self.assertEqual(json.loads(self.settings.read_text())["model"], "sonnet")
+
+    @unittest.skipUnless(WINDOWS, "Windows PowerShell profile encodings")
+    def test_windows_preserves_utf16_profile_content(self):
+        rc = self.rc_path()
+        original = "$ccmNote = '한글'\r\n"
+        rc.write_bytes(original.encode("utf-16"))
+        self.ccm("setup")
+        self.ccm("setup", "--undo")
+        self.assertEqual(rc.read_text(encoding="utf-8-sig"), original.replace("\r\n", "\n"))
+
+    @unittest.skipUnless(WINDOWS, "Windows console input")
+    def test_windows_picker_handles_arrows_and_cancelled_exit(self):
+        self.ccm("add", "work")
+        m = load_module()
+        output = io.StringIO()
+        cfg = self.config()
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(m.sys, "stdout", output), \
+                mock.patch.object(m.msvcrt, "kbhit", return_value=True), \
+                mock.patch.object(m.msvcrt, "getwch", side_effect=["\xe0", "P", "\x1b", "n", "\r"]):
+            selected = m.pick_interactive(cfg, True)
+        self.assertEqual(selected, "work")
+        self.assertEqual(cfg["current"], "work")
+        self.assertIn("종료할까요?", output.getvalue())
+        self.assertIn("\x1b[?25h", output.getvalue())
+
+    @unittest.skipUnless(WINDOWS, "Windows console cleanup")
+    def test_windows_console_mode_restored_on_error(self):
+        m = load_module()
+        api = mock.Mock()
+        api.GetStdHandle.return_value = 123
+        def original_mode(handle, mode):
+            mode._obj.value = 1
+            return 1
+        api.GetConsoleMode.side_effect = original_mode
+        with mock.patch.object(m, "windows_api", return_value=api):
+            with self.assertRaisesRegex(RuntimeError, "interrupt"):
+                with m.terminal_mode(0):
+                    raise RuntimeError("interrupt")
+        self.assertEqual(api.SetConsoleMode.call_args_list, [mock.call(123, 5), mock.call(123, 1)])
+
+    @unittest.skipUnless(WINDOWS, "Windows console interruption")
+    def test_windows_picker_restores_cursor_when_interrupted_waiting_for_input(self):
+        m = load_module()
+        cfg = {"profiles": {"default": {}}, "current": "default"}
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(m.sys, "stdout", output), \
+                mock.patch.object(m.msvcrt, "kbhit", return_value=False), \
+                mock.patch.object(m.time, "sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                m.pick_interactive(cfg, True)
+        self.assertIn("\x1b[?25h", output.getvalue())
+        self.assertEqual(cfg["current"], "default")
+
+    @unittest.skipUnless(WINDOWS, "Windows links without Developer Mode")
+    def test_windows_fallback_links_repair_and_remove_without_touching_sources(self):
+        m = load_module()
+        denied = OSError("symbolic link privilege unavailable")
+        denied.winerror = 1314
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(Path, "symlink_to", side_effect=denied):
+            profile = m.profile_dir("fallback")
+            profile.mkdir(parents=True)
+            done = m.repair_links(profile, True, "fallback")
+            self.assertFalse([error for _, _, error in done if error])
+            self.assertTrue(m.is_junction(profile / "projects"))
+            self.assert_shared(profile / "settings.json")
+            self.assertIn("settings.json", m.read_json(profile / ".ccm-hardlinks.json"))
+            m.write_json(self.settings, {"model": "changed"})
+            self.assertFalse((profile / "settings.json").samefile(self.settings))
+            m.repair_links(profile, True, "fallback")
+            self.assert_shared(profile / "settings.json")
+            m.remove_profile_dir(profile)
+        self.assertEqual(json.loads(self.settings.read_text())["model"], "changed")
+        self.assertTrue((self.claude_home / "projects" / "p1" / "s.jsonl").exists())
+
 
 class HelperTest(unittest.TestCase):
     @classmethod

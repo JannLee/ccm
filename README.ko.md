@@ -30,19 +30,42 @@ ccm은 로그인 토큰을 읽거나 옮기지 않습니다. 로그인은 Claude
 
 | 필요한 것 | 확인하는 명령 |
 | --- | --- |
-| macOS(확인함) 또는 Linux(확인하지 않음). Windows는 지원하지 않습니다 | |
-| Python 3.8 이상 | `python3 --version` |
+| macOS 또는 Windows 10/11, Linux는 CI에서 검증 | |
+| Python 3.8 이상 | `python3 --version` / Windows: `py -3 --version` |
 | Claude Code 설치와 로그인 | `claude --version` |
-| zsh 또는 bash | `echo $SHELL` |
+| macOS/Linux: zsh 또는 bash, Windows: PowerShell 5.1 이상 | `$PSVersionTable.PSVersion` |
 
 Claude Code가 없으면 [공식 설치 안내](https://docs.anthropic.com/en/docs/claude-code/setup)를 따라 설치하고 한 번 로그인합니다. ccm은 Python 표준 라이브러리만 쓰므로 따로 설치할 패키지는 없습니다.
 
-### 1단계. 내려받기
+### Windows 설치 (PowerShell)
+
+```powershell
+git clone https://github.com/JannLee/ccm.git (Join-Path $env:USERPROFILE 'ccm')
+Set-Location (Join-Path $env:USERPROFILE 'ccm')
+.\install.ps1
+ccm setup
+. $PROFILE.CurrentUserAllHosts
+ccm add work
+ccm ls
+```
+
+- `%USERPROFILE%\.local\bin`에 `ccm.cmd`·`ccm.ps1` 생성 및 사용자 PATH 등록
+- 기본 설치 폴더 변경 시 `-BinDir`, Python 경로 지정 시 `-Python` 사용
+- 설치 스크립트 실행 차단 시 `powershell -ExecutionPolicy Bypass -File .\install.ps1` 실행 후 새 PowerShell에서 계속 진행
+- PowerShell 프로필 실행 제한 환경에서는 `ccm.cmd run work`·`ccm.cmd next -c`로 직접 실행 가능
+- PowerShell 5.1·7의 현재 사용자 공통 프로필에 `claude` 함수 등록
+- CMD에서도 `ccm.cmd` 사용 가능, 일반 `claude` 명령의 계정 연동은 PowerShell에서 지원
+- 기본 심볼릭 링크 생성 불가 시 폴더는 junction, 파일은 hard link 사용
+- hard link 사용 시 `~/.claude`와 `~/.ccm`을 같은 NTFS 드라이브에 배치 필요
+
+Windows에서는 아래 4단계부터 계정 추가·사용량 확인 절차 참조.
+
+### macOS/Linux 1단계. 내려받기
 
 계속 둘 폴더에 내려받습니다. 나중에 폴더를 옮기면 다시 연결해야 하므로(아래 "자주 묻는 질문" 참고) 자리를 먼저 정하는 편이 좋습니다.
 
 ```sh
-git clone https://github.com/revfactory/ccm.git ~/ccm
+git clone https://github.com/JannLee/ccm.git ~/ccm
 cd ~/ccm
 ```
 
@@ -228,12 +251,19 @@ rm ~/.local/bin/ccm
 rm -rf ~/.ccm
 ```
 
+Windows에서는 `ccm rm`·`ccm setup --undo` 실행 후 아래 명령으로 파일 삭제.
+
+```powershell
+Remove-Item -LiteralPath "$env:USERPROFILE\.local\bin\ccm.cmd", "$env:USERPROFILE\.local\bin\ccm.ps1"
+Remove-Item -LiteralPath "$env:USERPROFILE\.ccm" -Recurse
+```
+
 ## 동작 방식
 
 - **계정마다 설정 폴더를 따로 둡니다.** Claude Code 문서가 안내하는 다중 계정 방식(`CLAUDE_CONFIG_DIR`)을 씁니다. 원래 쓰던 `~/.claude`는 `default` 계정이고, 추가한 계정은 `~/.ccm/profiles/<이름>/`을 씁니다.
 - **로그인은 Claude Code가 처리합니다.** `ccm add`가 그 폴더를 지정해 `claude auth login`을 실행합니다. 로그인 정보는 Claude Code가 폴더별로 키체인에 저장합니다.
 - **사용량은 상태줄이 기록합니다.** Claude Code는 상태줄 명령에 `rate_limits`(5시간·주간 사용률과 초기화 시각)를 넘겨줍니다. ccm은 이 값을 `~/.ccm/usage/<이름>.json`에 저장합니다.
-- **설정과 작업 기록은 계정끼리 공유합니다.** 추가한 계정 폴더에서 `~/.claude`의 설정·스킬·플러그인·세션 기록·작업 목록으로 심볼릭 링크를 겁니다. 그래서 같은 프로젝트에서는 계정을 바꿔도 이전 작업을 그대로 이어 갑니다.
+- **설정과 작업 기록은 계정끼리 공유합니다.** 추가한 계정 폴더에서 `~/.claude`의 설정·스킬·플러그인·세션 기록·작업 목록으로 링크를 겁니다. Windows에서는 심볼릭 링크 권한이 없으면 junction과 hard link를 사용합니다. 그래서 같은 프로젝트에서는 계정을 바꿔도 이전 작업을 그대로 이어 갑니다.
 
 <details>
 <summary><b>계정을 바꿔도 이어지는 작업</b></summary>
@@ -273,6 +303,10 @@ rm -rf ~/.ccm
 - **`jobs`, `daemon`**: 계정마다 따로 실행되는 백그라운드 작업입니다. 공유하면 같은 작업이 두 번 실행될 수 있어서 나눠 둡니다.
 
 Claude Code가 설정 파일을 저장하면서 링크를 일반 파일로 바꾸면 그 항목은 더 이상 공유되지 않습니다. `ccm doctor`가 이런 항목을 찾아 알려 줍니다.
+
+- Windows에서 원본 파일 교체로 끊어진 hard link는 다음 `ccm`·`ccm ls`·`ccm use`·`ccm run`·`ccm next` 실행 시 복구
+- 프로필에서 별도로 수정한 파일은 자동 교체 대상에서 제외
+- `ccm setup`·`ccm setup --undo` 실행 후 공유 설정 파일 연결 복구
 
 </details>
 
@@ -322,6 +356,16 @@ Claude Code가 설정 파일을 저장하면서 링크를 일반 파일로 바�
 ```sh
 python3 -m unittest tests.test_ccm -v
 ```
+
+Windows:
+
+```powershell
+py -3 -X utf8 -m unittest tests.test_ccm -v
+```
+
+- Windows: 계정 관리·공유 링크·설치 명령·PowerShell·상태줄 검증
+- POSIX 가상 터미널 테스트는 Windows에서 제외, Windows 키 입력·콘솔 복구는 별도 테스트로 검증
+- GitHub Actions에서 Windows·macOS·Linux 및 Python 3.8·3.14 조합 검증
 
 테스트는 가짜 `claude`(`tests/fake_claude.py`)와 `_workspace/tmp/` 아래 임시 폴더만 쓰고, 실제 키체인과 `~/.claude`는 건드리지 않습니다.
 

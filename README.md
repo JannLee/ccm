@@ -32,19 +32,42 @@ ccm never reads or copies your login tokens. Logging in is done by Claude Code's
 
 | You need | Check with |
 | --- | --- |
-| macOS (tested) or Linux (not tested). Windows is not supported | |
-| Python 3.8 or later | `python3 --version` |
+| macOS or Windows 10/11; Linux covered by CI | |
+| Python 3.8 or later | `python3 --version` / Windows: `py -3 --version` |
 | Claude Code, installed and logged in | `claude --version` |
-| zsh or bash | `echo $SHELL` |
+| macOS/Linux: zsh or bash; Windows: PowerShell 5.1 or later | `$PSVersionTable.PSVersion` |
 
 If you don't have Claude Code yet, follow the [official setup guide](https://docs.anthropic.com/en/docs/claude-code/setup) and log in once. ccm uses only the Python standard library, so there is nothing else to install.
 
-### Step 1. Download
+### Windows installation (PowerShell)
+
+```powershell
+git clone https://github.com/JannLee/ccm.git (Join-Path $env:USERPROFILE 'ccm')
+Set-Location (Join-Path $env:USERPROFILE 'ccm')
+.\install.ps1
+ccm setup
+. $PROFILE.CurrentUserAllHosts
+ccm add work
+ccm ls
+```
+
+- Creates `ccm.cmd` and `ccm.ps1` under `%USERPROFILE%\.local\bin` and adds it to your user PATH.
+- Use `-BinDir` for a different installation folder or `-Python` to select a Python executable.
+- If script execution is blocked, run `powershell -ExecutionPolicy Bypass -File .\install.ps1`, then continue in a new PowerShell session.
+- If profile execution is restricted, use `ccm.cmd run work` or `ccm.cmd next -c` directly.
+- Installs the `claude` function in the current user's all-hosts profile for the PowerShell version running `ccm` (5.1 or 7).
+- CMD supports `ccm.cmd`; switching plain `claude` through a shell function requires PowerShell.
+- Falls back to directory junctions and file hard links when symbolic links are unavailable.
+- Hard links require `~/.claude` and `~/.ccm` to be on the same NTFS drive.
+
+Continue with Step 4 below for account registration and usage recording.
+
+### macOS/Linux Step 1. Download
 
 Put ccm in a folder where it can stay. If you move the folder later you'll have to reconnect it (see the FAQ), so pick the place first.
 
 ```sh
-git clone https://github.com/revfactory/ccm.git ~/ccm
+git clone https://github.com/JannLee/ccm.git ~/ccm
 cd ~/ccm
 ```
 
@@ -231,12 +254,19 @@ rm ~/.local/bin/ccm
 rm -rf ~/.ccm
 ```
 
+On Windows, run `ccm rm` and `ccm setup --undo` first, then remove the files:
+
+```powershell
+Remove-Item -LiteralPath "$env:USERPROFILE\.local\bin\ccm.cmd", "$env:USERPROFILE\.local\bin\ccm.ps1"
+Remove-Item -LiteralPath "$env:USERPROFILE\.ccm" -Recurse
+```
+
 ## How it works
 
 - **A separate config folder per account.** ccm uses the multi-account approach from the Claude Code docs (`CLAUDE_CONFIG_DIR`). Your existing `~/.claude` is the `default` account; each added account uses `~/.ccm/profiles/<name>/`.
 - **Claude Code handles login.** `ccm add` runs `claude auth login` with that folder. Claude Code stores the login in the keychain per folder.
 - **The status line records usage.** Claude Code passes `rate_limits` (5-hour and weekly usage and reset times) to the status line command. ccm saves them to `~/.ccm/usage/<name>.json`.
-- **Settings and history are shared.** Each added account's folder contains symlinks to the settings, skills, plugins, session history and task lists in `~/.claude`. That is why you can switch accounts in the same project and continue where you left off.
+- **Settings and history are shared.** Each added account's folder links to the settings, skills, plugins, session history and task lists in `~/.claude`. Windows uses junctions and hard links when symbolic links are unavailable. That is why you can switch accounts in the same project and continue where you left off.
 
 <details>
 <summary><b>What carries over when you switch accounts</b></summary>
@@ -276,6 +306,10 @@ Kept separate per account:
 - **`jobs`, `daemon`**: background jobs that run per account. Sharing them could run the same job twice.
 
 If Claude Code replaces a link with a regular file when saving settings, that item is no longer shared. `ccm doctor` finds such items.
+
+- On Windows, `ccm`, `ccm ls`, `ccm use`, `ccm run` and `ccm next` repair hard links broken by replacement of the original file.
+- Files edited separately in a profile are preserved.
+- `ccm setup` and `ccm setup --undo` reconnect shared settings after updating them.
 
 </details>
 
@@ -325,6 +359,16 @@ Only missing entries are added; nothing is removed. MCP servers with the same na
 ```sh
 python3 -m unittest tests.test_ccm -v
 ```
+
+Windows:
+
+```powershell
+py -3 -X utf8 -m unittest tests.test_ccm -v
+```
+
+- Windows tests cover account management, shared links, installation, PowerShell and status lines.
+- POSIX PTY tests are skipped on Windows; Windows key handling and console restoration have separate tests.
+- GitHub Actions checks Windows, macOS and Linux with Python 3.8 and 3.14 combinations.
 
 The tests use a fake `claude` (`tests/fake_claude.py`) and temporary folders under `_workspace/tmp/`; they never touch your real keychain or `~/.claude`.
 
